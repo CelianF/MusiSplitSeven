@@ -127,6 +127,18 @@ def main(argv: list[str]) -> int:
         return (f"page={page} mode={mode} icon={not app.windowIcon().isNull()} "
                 f"history_rows={rows} shot={shot.width()}x{shot.height()}")
 
+    def single_instance():
+        from .gui import SingleInstance
+        first, second = SingleInstance(), SingleInstance()
+        assert first.acquire(), "first lock failed"
+        try:
+            assert not second.acquire(), "a second copy could start"
+            first.serve()
+            assert first.server.isListening(), first.server.errorString()
+        finally:
+            first.lock.unlock()
+        return "second launch is refused"
+
     def youtube_download():
         path, title, _tags = youtube.download_audio("https://www.youtube.com/watch?v=jNQXAC9IVRw", tmp)
         return f"{title!r} {path.stat().st_size} bytes"
@@ -142,6 +154,7 @@ def main(argv: list[str]) -> int:
     check("history entry", history)
     check("track player (QtMultimedia)", track_player)
     check("main window", main_window)
+    check("single instance", single_instance)
     if "--net" in argv:
         # Not counted as a failure: YouTube often blocks CI machines as bots.
         try:

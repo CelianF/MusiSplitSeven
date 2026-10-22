@@ -266,6 +266,35 @@ class ModelDownloadTests(unittest.TestCase):
         self.assertEqual(seen[0], 1_000_000)
         self.assertEqual(path.read_bytes(), self.payload)
 
+    def test_rename_waits_out_a_short_lock(self):
+        # Windows: an antivirus scanning the new file makes the rename fail for a moment.
+        real = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError(32, "being used by another process")
+            real(src, dst)
+
+        with mock.patch.object(model.os, "replace", side_effect=flaky), mock.patch.object(model.time, "sleep"):
+            path = model.ensure_model()
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(path.read_bytes(), self.payload)
+
+    def test_rename_locked_for_good_keeps_download(self):
+        with mock.patch.object(model.os, "replace", side_effect=PermissionError(32, "in use")), \
+                mock.patch.object(model.time, "sleep"):
+            with self.assertRaisesRegex(UserError, "won't download again"):
+                model.ensure_model()
+        part = self.models / "htdemucs.onnx.part"
+        self.assertEqual(part.stat().st_size, len(self.payload))
+        # Next try: no new download, just the rename.
+        seen = []
+        model.ensure_model(lambda d, t: seen.append(d))
+        self.assertEqual(seen, [])
+        self.assertTrue(model.is_model_ready())
+
     def test_corrupt_download_rejected(self):
         with mock.patch.object(model, "MODEL_SHA256", "0" * 64):
             with self.assertRaisesRegex(UserError, "damaged"):

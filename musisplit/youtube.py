@@ -8,9 +8,6 @@ from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-import yt_dlp
-from yt_dlp.utils import DownloadCancelled, DownloadError
-
 from .errors import Cancelled, NoInternetError, UserError, looks_like_network_error
 from .paths import ffmpeg_exe
 
@@ -45,7 +42,7 @@ class _QuietLogger:
     def error(self, msg: str) -> None: ...
 
 
-def _friendly(exc: DownloadError) -> UserError:
+def _friendly(exc: Exception) -> UserError:
     msg = str(exc)
     log.warning("yt-dlp failed: %s", msg)
     low = msg.lower()
@@ -79,6 +76,9 @@ def download_audio(url: str, workdir: Path,
     Returns ``(file, title, tags)`` where ``tags`` holds whatever YouTube
     knows about the song (artist, track, channel), used to find lyrics.
     """
+    import yt_dlp  # slow to import: only when actually downloading
+    from yt_dlp.utils import DownloadCancelled, DownloadError
+
     if not is_youtube_url(url):
         raise UserError(
             "That doesn't look like a YouTube video link.\n"

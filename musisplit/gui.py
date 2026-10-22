@@ -11,8 +11,10 @@ Every split is kept in History until the user deletes it.
 from __future__ import annotations
 
 import bisect
+import getpass
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -22,11 +24,12 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QLockFile, QObject, QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap, QPolygonF,
 )
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
     QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
@@ -1665,6 +1668,64 @@ def make_app(argv: list[str]) -> QApplication:
     return app
 
 
+class SingleInstance:
+    """Only one window at a time.
+
+    Launching the app again (a double double-click, or the installer's
+    "launch" box plus the shortcut) brings the open window to the front
+    instead of starting a second copy that would fight over the same files.
+    The lock file is atomic, so even two launches a few ms apart are safe.
+    """
+
+    def __init__(self) -> None:
+        user = re.sub(r"\W", "_", getpass.getuser() or "user")
+        self.name = f"{APP_NAME}-{user}"
+        self.lock = QLockFile(str(app_data_dir() / "app.lock"))
+        self.lock.setStaleLockTime(0)  # only stale if the owning process is gone
+        self.server: QLocalServer | None = None
+        self.window: QMainWindow | None = None
+
+    def acquire(self) -> bool:
+        try:
+            app_data_dir().mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return True  # can't lock: better to run than to refuse
+        return self.lock.tryLock(0)
+
+    def notify_running(self, timeout_s: float = 8.0) -> bool:
+        """Ask the running copy to show itself (it may still be starting up)."""
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            sock = QLocalSocket()
+            sock.connectToServer(self.name)
+            if sock.waitForConnected(500):
+                sock.write(b"show")
+                sock.waitForBytesWritten(1000)
+                sock.disconnectFromServer()
+                return True
+            time.sleep(0.25)
+        return False
+
+    def serve(self) -> None:
+        self.server = QLocalServer()
+        QLocalServer.removeServer(self.name)
+        self.server.newConnection.connect(self._on_connection)
+        if not self.server.listen(self.name):
+            log.warning("single-instance server: %s", self.server.errorString())
+
+    def _on_connection(self) -> None:
+        while self.server.hasPendingConnections():
+            self.server.nextPendingConnection().disconnectFromServer()
+        log.info("another launch asked to show the window")
+        if self.window is not None:
+            w = self.window
+            w.setWindowState((w.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+            w.show()
+            w.raise_()
+            w.activateWindow()
+            QApplication.alert(w)
+
+
 def main() -> int:
     _setup_logging()
     log.info("%s %s starting (frozen=%s)", APP_NAME, __version__, IS_FROZEN)
@@ -1675,8 +1736,19 @@ def main() -> int:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.{APP_NAME}")
         except Exception:
             pass
-    library.clean_incomplete()
     app = make_app(sys.argv)
+    instance = SingleInstance()
+    if not instance.acquire():
+        log.info("already running")
+        if not instance.notify_running():
+            QMessageBox.information(None, APP_NAME, f"{APP_NAME} is already open.")
+        return 0
+    instance.serve()
+    # Safe now that no other copy can be in the middle of a split.
+    library.clean_incomplete()
     win = MainWindow()
+    instance.window = win
     win.show()
-    return app.exec()
+    code = app.exec()
+    instance.lock.unlock()
+    return code

@@ -17,13 +17,16 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from . import audio, library, youtube
 from .errors import UserError
 from .model import is_model_ready, model_path
-from .separator import Separator, normalize_pair
+
+if TYPE_CHECKING:
+    from .separator import Separator
 
 
 class Stage(enum.Enum):
@@ -43,12 +46,14 @@ class JobResult:
     instrumental: Path
 
 
-_separator: Separator | None = None
+_separator: "Separator | None" = None
 _separator_lock = threading.Lock()
 
 
-def get_separator() -> Separator:
+def get_separator() -> "Separator":
     """Load the ONNX session once and reuse it for every song."""
+    from .separator import Separator  # onnxruntime is slow to import: only when splitting
+
     global _separator
     with _separator_lock:
         if _separator is None:
@@ -149,6 +154,8 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
         cancel=cancel,
     )
     del mix
+    from .separator import normalize_pair
+
     vocals, instrumental = normalize_pair(vocals, instrumental)
     return Separated(title=title, vocals=vocals, instrumental=instrumental, tags=tags)
 

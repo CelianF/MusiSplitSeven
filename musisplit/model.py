@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -107,5 +108,25 @@ def ensure_model(on_progress: DownloadProgress | None = None,
     if hasher.hexdigest() != MODEL_SHA256:
         part.unlink(missing_ok=True)
         raise UserError("The downloaded model was damaged. Please try again.")
-    os.replace(part, target)
+    _replace_with_retry(part, target)
     return target
+
+
+def _replace_with_retry(src: Path, dst: Path, attempts: int = 30, delay: float = 0.5) -> None:
+    """Rename ``src`` to ``dst``, waiting out short locks.
+
+    On Windows, an antivirus scanning the freshly written 316 MB file holds it
+    open for a few seconds, and the rename fails with WinError 32 meanwhile.
+    """
+    for i in range(attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError as exc:
+            if i == attempts - 1:
+                raise UserError(
+                    "The downloaded model is being used by another program "
+                    "(often the antivirus checking it).\n"
+                    "Wait a minute, then click Try again. It won't download again."
+                ) from exc
+            time.sleep(delay)
