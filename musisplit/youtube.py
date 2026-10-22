@@ -73,8 +73,12 @@ def _friendly(exc: DownloadError) -> UserError:
 
 def download_audio(url: str, workdir: Path,
                    on_progress: Callable[[float | None], None] | None = None,
-                   cancel: threading.Event | None = None) -> tuple[Path, str]:
-    """Download the best audio-only stream into ``workdir``. Returns ``(file, title)``."""
+                   cancel: threading.Event | None = None) -> tuple[Path, str, dict]:
+    """Download the best audio-only stream into ``workdir``.
+
+    Returns ``(file, title, tags)`` where ``tags`` holds whatever YouTube
+    knows about the song (artist, track, channel), used to find lyrics.
+    """
     if not is_youtube_url(url):
         raise UserError(
             "That doesn't look like a YouTube video link.\n"
@@ -133,4 +137,10 @@ def download_audio(url: str, workdir: Path,
         if not found:
             raise UserError("The download finished but no audio file was found. Please try again.")
         path = found[0]
-    return path, info.get("title") or "YouTube audio"
+    artists = info.get("artists") or []
+    tags = {
+        "artist": info.get("artist") or (artists[0] if artists else "") or "",
+        "track": info.get("track") or "",
+        "channel": info.get("channel") or info.get("uploader") or "",
+    }
+    return path, info.get("title") or "YouTube audio", tags

@@ -8,6 +8,7 @@ Each split is a folder::
         instrumental.mp3
         vocals.wave.npy        waveform bars for the player view
         instrumental.wave.npy
+        lyrics.json            lyrics found on LRCLIB (cache, added later)
 
 A split is written into a hidden ``.<name>.tmp`` folder and renamed when
 complete, so a crash or cancel never leaves a half-written entry.
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, waveform
+from . import audio, lyrics, waveform
 from .errors import UserError
 from .paths import app_data_dir
 
@@ -45,6 +46,9 @@ class Entry:
     source: str
     created: datetime
     duration_s: float
+    artist: str = ""
+    track: str = ""
+    channel: str = ""
 
     @property
     def vocals(self) -> Path:
@@ -94,10 +98,26 @@ class Entry:
             source=meta.get("source", ""),
             created=datetime.fromisoformat(meta["created"]),
             duration_s=float(meta.get("duration_s", 0)),
+            artist=meta.get("artist", ""),
+            track=meta.get("track", ""),
+            channel=meta.get("channel", ""),
         )
 
+    def cached_lyrics(self) -> "lyrics.Lyrics | None":
+        try:
+            return lyrics.Lyrics.from_json((self.folder / "lyrics.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
 
-def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str,
+    def save_lyrics(self, result: "lyrics.Lyrics") -> None:
+        try:
+            (self.folder / "lyrics.json").write_text(result.to_json(), encoding="utf-8")
+        except OSError:
+            pass  # only a cache
+
+
+def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str, *,
+        tags: dict | None = None,
         on_progress: Callable[[float | None, str], None] | None = None,
         cancel: threading.Event | None = None) -> Entry:
     """Store a separated song (MP3s + waveform bars) and return its entry."""
@@ -132,6 +152,7 @@ def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str,
             "source": source,
             "created": created.isoformat(),
             "duration_s": round(vocals.shape[1] / audio.SAMPLE_RATE, 3),
+            **{k: v for k, v in (tags or {}).items() if k in ("artist", "track", "channel") and v},
         }
         (tmp / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
         final = root / name

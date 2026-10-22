@@ -14,12 +14,13 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 import numpy as np
 
-from musisplit import audio, library, model, pipeline, waveform, youtube
+from musisplit import audio, library, lyrics, model, pipeline, waveform, youtube
 from musisplit.errors import Cancelled, NoInternetError, UserError
 from musisplit.paths import ffmpeg_exe
 from musisplit.separator import PEAK_TARGET, normalize_pair
@@ -126,6 +127,17 @@ class AudioIoTests(unittest.TestCase):
             p.write_text("this is not audio")
             with self.assertRaises(UserError):
                 audio.decode(p)
+
+    def test_read_tags(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src.wav"
+            make_song(src, 1)
+            tagged = Path(d) / "tagged.mp3"
+            subprocess.run([ffmpeg_exe(), "-v", "error", "-y", "-i", str(src), "-metadata", "artist=Beyoncé",
+                            "-metadata", "title=Halo = Love; #1", str(tagged)], check=True)
+            tags = audio.read_tags(tagged)
+            self.assertEqual((tags.get("artist"), tags.get("title")), ("Beyoncé", "Halo = Love; #1"))
+            self.assertEqual(audio.read_tags(Path(d) / "missing.mp3"), {})
 
     def test_mp3_roundtrip(self):
         with tempfile.TemporaryDirectory() as d:
@@ -305,6 +317,72 @@ class WaveformTests(unittest.TestCase):
         self.assertLess(a[: waveform.BUCKETS // 2 - 5].max(), a[waveform.BUCKETS // 2 + 5:].min())
 
 
+class LyricsTests(unittest.TestCase):
+    def test_parse_lrc(self):
+        text = "[ar: x]\n[00:12.50] First line\n[00:05.00][01:00.00] Chorus\n[00:20.00]\nno tag"
+        self.assertEqual(lyrics.parse_lrc(text),
+                         [(5000, "Chorus"), (12500, "First line"), (20000, ""), (60000, "Chorus")])
+
+    def test_clean_and_guess(self):
+        cases = {
+            "Daft Punk - Get Lucky (Official Audio) ft. Pharrell Williams": ("Daft Punk", "Get Lucky"),
+            "Stromae - Alors on danse (Clip Officiel)": ("Stromae", "Alors on danse"),
+            "Imagine Dragons | Believer (Lyrics)": ("Imagine Dragons", "Believer"),
+            "Rick Astley - Never Gonna Give You Up [4K Remaster]": ("Rick Astley", "Never Gonna Give You Up"),
+            "Song (Acoustic)": ("", "Song (Acoustic)"),  # meaningful brackets stay
+        }
+        for title, expected in cases.items():
+            self.assertEqual(lyrics.guess_artist_track(title), expected, title)
+        self.assertEqual(lyrics.guess_artist_track("Believer", channel="ImagineDragonsVEVO"),
+                         ("Imagine Dragons", "Believer"))
+        self.assertEqual(lyrics.guess_artist_track("whatever", artist="A", track="T (Official Video)"), ("A", "T"))
+
+    REC = {"artistName": "Artist", "trackName": "Song", "duration": 200.0,
+           "plainLyrics": "line one\nline two " * 10, "syncedLyrics": "[00:01.00] line one\n[00:02.00] line two"}
+
+    def fake_get(self, routes):
+        def _get(path, params):
+            return routes.get(path)
+        return mock.patch.object(lyrics, "_get", side_effect=_get)
+
+    def test_exact_match_first(self):
+        with self.fake_get({"get": self.REC}) as g:
+            res = lyrics.find("Artist - Song (Official Video)", 201)
+        self.assertEqual(res.status, lyrics.FOUND)
+        self.assertEqual(res.synced, [(1000, "line one"), (2000, "line two")])
+        self.assertEqual(g.call_args_list[0].args[1], {"artist_name": "Artist", "track_name": "Song", "duration": 201})
+
+    def test_search_prefers_matching_duration_and_skips_junk(self):
+        junk = dict(self.REC, plainLyrics="probe", syncedLyrics="[00:01.00] probe", duration=200)
+        remix = dict(self.REC, trackName="Song (Remix)", duration=420)
+        good = dict(self.REC, duration=199)
+        with self.fake_get({"get": junk, "search": [junk, remix, good]}):
+            res = lyrics.find("Artist - Song", 200)
+        self.assertEqual((res.status, res.track), (lyrics.FOUND, "Song"))
+
+    def test_not_found_and_instrumental(self):
+        with self.fake_get({"get": None, "search": []}):
+            self.assertEqual(lyrics.find("Unknown thing", 30).status, lyrics.NOT_FOUND)
+        inst = dict(self.REC, plainLyrics=None, syncedLyrics=None, instrumental=True)
+        with self.fake_get({"get": inst}):
+            self.assertEqual(lyrics.find("Artist - Song", 200).status, lyrics.INSTRUMENTAL)
+
+    def test_offline(self):
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("getaddrinfo failed")):
+            with self.assertRaises(NoInternetError):
+                lyrics.find("Artist - Song", 200)
+
+    def test_json_roundtrip(self):
+        res = lyrics.Lyrics(lyrics.FOUND, "A", "T", "p", [(1, "x")], "A T")
+        self.assertEqual(lyrics.Lyrics.from_json(res.to_json()), res)
+
+    @unittest.skipUnless(NET_TESTS, "set MUSISPLIT_NET_TESTS=1")
+    def test_live_lrclib(self):
+        res = lyrics.find("Rick Astley - Never Gonna Give You Up (Official Video) (4K Remaster)", 213)
+        self.assertEqual(res.status, lyrics.FOUND)
+        self.assertGreater(len(res.synced), 20)
+
+
 class LibraryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -351,6 +429,16 @@ class LibraryTests(unittest.TestCase):
         bars = e.waveform("vocals")
         self.assertEqual(bars.shape, (waveform.BUCKETS,))
         self.assertTrue((e.folder / "instrumental.wave.npy").is_file())
+
+    def test_tags_and_lyrics_cache(self):
+        x = np.zeros((2, 44100), np.float32)
+        e = library.add(x, x, "T", "https://youtu.be/x", tags={"artist": "A", "track": "Tr", "channel": "", "junk": 1})
+        e = library.list_entries()[0]
+        self.assertEqual((e.artist, e.track, e.channel), ("A", "Tr", ""))
+        self.assertIsNone(e.cached_lyrics())
+        res = lyrics.Lyrics(lyrics.FOUND, "A", "Tr", "words", [(0, "words")])
+        e.save_lyrics(res)
+        self.assertEqual(e.cached_lyrics(), res)
 
     def test_missing_library_dir(self):
         self.assertEqual(library.list_entries(), [])

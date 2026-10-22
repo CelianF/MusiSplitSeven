@@ -128,7 +128,7 @@ def main(argv: list[str]) -> int:
                 f"history_rows={rows} shot={shot.width()}x{shot.height()}")
 
     def youtube_download():
-        path, title = youtube.download_audio("https://www.youtube.com/watch?v=jNQXAC9IVRw", tmp)
+        path, title, _tags = youtube.download_audio("https://www.youtube.com/watch?v=jNQXAC9IVRw", tmp)
         return f"{title!r} {path.stat().st_size} bytes"
 
     from .gui import make_app

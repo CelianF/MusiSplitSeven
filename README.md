@@ -55,7 +55,19 @@ and run `MusiSplitSeven.exe`.
    and you can pick another place. Existing files are never overwritten: a
    number is added instead (`Song (2) - vocals.mp3`). **Open folder** shows the
    saved file.
-5. Click **New split** to do another song.
+5. Click **New split** (top right) to do another song.
+
+### Lyrics
+
+Next to **Tracks**, the **Lyrics** tab shows the song's lyrics. They are
+found automatically on [LRCLIB](https://lrclib.net), a free community lyrics
+database, using the YouTube title or the file's artist/title tags. When the
+lyrics are timed, the current line lights up while you play the instrumental or
+the vocals: good for karaoke. Click a line to jump to it. If the wrong song
+shows up, type the artist and title in the search box. Lyrics are saved with
+the song in History.
+
+Only the song's artist and title (and length) are sent to lrclib.net.
 
 While a song is being split, the window only shows the progress and a Cancel
 button.
@@ -167,6 +179,7 @@ The app icon is generated from `assets/icon_source.jpg` by
 | `musisplit/separator.py` | runs the `htdemucs` ONNX model in 7.8 s chunks with overlap-add; vocals = stem 3, instrumental = drums + bass + other |
 | `musisplit/library.py` | the History: each split is kept as two MP3s plus waveform bars, written atomically |
 | `musisplit/waveform.py` | peak levels for the bar waveforms (numpy only) |
+| `musisplit/lyrics.py` | lyrics lookup on LRCLIB: title clean-up, exact match then search, LRC parsing |
 | `musisplit/pipeline.py` | Download → Separate → Export (into History), then copy to a folder; no UI code |
 | `musisplit/gui.py` | PySide6 window; all work runs on background threads |
 

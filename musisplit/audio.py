@@ -1,6 +1,7 @@
 """Decode any audio file to float32 stereo 44.1 kHz and encode MP3, via ffmpeg."""
 from __future__ import annotations
 
+import re
 import subprocess
 import tempfile
 import threading
@@ -45,6 +46,23 @@ def decode(path: Path) -> np.ndarray:
     audio = np.frombuffer(raw, dtype=np.float32)
     audio = audio[: len(audio) - len(audio) % CHANNELS]
     return np.ascontiguousarray(audio.reshape(-1, CHANNELS).T)
+
+
+def read_tags(path: Path) -> dict:
+    """Artist/title tags of an audio file (lower-case keys), or ``{}``."""
+    try:
+        proc = _run_ffmpeg(["-i", str(path), "-f", "ffmetadata", "-"],
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        out, _ = proc.communicate(timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    tags = {}
+    for line in out.decode("utf-8", "replace").splitlines():
+        if "=" in line and not line.startswith((";", "[")):
+            key, _, value = line.partition("=")
+            # ffmetadata escapes = ; # \ and newlines with a backslash.
+            tags.setdefault(key.strip().lower(), re.sub(r"\\(.)", r"\1", value).strip())
+    return tags
 
 
 def encode_mp3(audio: np.ndarray, dest: Path, *, title: str = "",

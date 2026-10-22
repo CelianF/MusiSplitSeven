@@ -10,6 +10,7 @@ Every split is kept in History until the user deletes it.
 """
 from __future__ import annotations
 
+import bisect
 import logging
 import os
 import subprocess
@@ -21,7 +22,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPixmap, QPolygonF,
 )
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__, library
+from . import lyrics as lyrics_mod
 from .audio import SUPPORTED_EXTENSIONS
 from .errors import Cancelled, UserError
 from .library import Entry
@@ -103,6 +105,16 @@ QPushButton#play:hover { background: @GREEN_HOVER; }
 #success { background: @GREEN_SOFT; color: @GREEN_DARK; border: 1px solid #C2E9D8; border-radius: 10px; padding: 10px 12px; }
 #historyRow { background: @CARD; border: 1px solid @BORDER; border-radius: 12px; }
 #historyRow[current="true"] { border: 2px solid @GREEN; }
+QPushButton#tab { background: transparent; border: none; border-bottom: 3px solid transparent; border-radius: 0; padding: 6px 2px; margin-right: 18px; color: @MUTED; font-size: 10.5pt; }
+QPushButton#tab:hover { color: @TEXT; }
+QPushButton#tab:checked { color: @GREEN_DARK; border-bottom: 3px solid @GREEN_MID; }
+QPushButton#pill { padding: 6px 14px 6px 10px; border-radius: 15px; background: @GREEN_SOFT; color: @GREEN_DARK; border: 1px solid #C2E9D8; }
+QPushButton#pill:hover { background: #D3EFE2; }
+#lyricLine { color: #8E887A; font-size: 12pt; padding: 3px 8px; border-radius: 7px; }
+#lyricLine:hover { background: @SAND; }
+#lyricLine[current="true"] { color: @GREEN_DARK; font-weight: 700; background: @GREEN_SOFT; }
+#lyricsPlain { font-size: 11.5pt; padding: 4px 8px; }
+#lyricsBox { background: @CARD; border: none; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar::handle:vertical { background: #DDD4BF; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -228,8 +240,26 @@ class JobWorker(QThread):
         except MemoryError:
             self.failed.emit("Your computer ran out of memory.\nClose other programs and try again.")
         except Exception:
-            log.exception("split failed")
+            log.exception("background job failed")
             self.failed.emit(UNEXPECTED.format(log=log_path()))
+
+
+class BackgroundCall(QObject):
+    """Run a short network call on a daemon thread (dropped at exit, unlike a QThread)."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def start(self, fn: Callable) -> None:
+        def run() -> None:
+            try:
+                self.succeeded.emit(fn())
+            except UserError as exc:
+                self.failed.emit(str(exc))
+            except Exception:
+                log.exception("background call failed")
+                self.failed.emit(UNEXPECTED.format(log=log_path()))
+        threading.Thread(target=run, daemon=True).start()
 
 
 def split_into_library(source: str) -> Callable:
@@ -376,6 +406,8 @@ class TrackRow(QWidget):
     started = Signal(object)  # this row, so the page can pause the other one
     saveClicked = Signal(str)
     error = Signal(str)
+    position = Signal(int)  # ms, while playing and after seeks
+    playingChanged = Signal(bool)
 
     def __init__(self, stem: str, label: str) -> None:
         super().__init__()
@@ -473,6 +505,11 @@ class TrackRow(QWidget):
             self.wave.set_played(pos / dur)
         if not self.wave.dragging:
             self._show_time(pos, dur)
+        self.position.emit(pos)
+
+    def seek(self, ms: int) -> None:
+        self.player.setPosition(int(ms))
+        self._tick()
 
     def _show_time(self, pos: float, dur: int) -> None:
         self.time.setText(f"{_fmt_clock(pos)} / {_fmt_clock(dur)}")
@@ -482,6 +519,7 @@ class TrackRow(QWidget):
         self.play_btn.setIcon(_transport_icon(playing))
         self.timer.start() if playing else self.timer.stop()
         self._tick()
+        self.playingChanged.emit(playing)
 
     def _on_error(self, _err, message: str) -> None:
         log.warning("player error (%s): %s", self.stem, message)
@@ -491,6 +529,169 @@ class TrackRow(QWidget):
                 "This song can't be played on this computer (is a speaker or headset connected?).\n"
                 "You can still save the files and listen to them in your music player."
             )
+
+
+class LyricLine(QLabel):
+    clicked = Signal(int)
+
+    def __init__(self, ms: int, text: str) -> None:
+        super().__init__(text or "♪")
+        self.ms = ms
+        self.setObjectName("lyricLine")
+        self.setWordWrap(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip(f"Jump to {_fmt_clock(ms)}")
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton:
+            self.clicked.emit(self.ms)
+
+
+class LyricsView(QWidget):
+    """Lyrics for the shown song, following the playing track when they are synced."""
+
+    playRequested = Signal(str)  # stem
+    lineClicked = Signal(int)  # ms
+    searchRequested = Signal(str)
+    retryRequested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(10)
+
+        transport = QHBoxLayout()
+        transport.setSpacing(8)
+        self.play_buttons: dict[str, QPushButton] = {}
+        for stem, label in (("instrumental", "Instrumental"), ("vocals", "Vocals")):
+            b = _button(label, "pill", lambda _=False, s=stem: self.playRequested.emit(s))
+            b.setIcon(_transport_icon(False))
+            b.setIconSize(QSize(16, 16))
+            self.play_buttons[stem] = b
+            transport.addWidget(b)
+        transport.addStretch()
+        self.time = QLabel("")
+        self.time.setObjectName("time")
+        transport.addWidget(self.time)
+        lay.addLayout(transport)
+
+        self.status = QLabel()
+        self.status.setObjectName("muted")
+        self.status.setWordWrap(True)
+        self.retry = _button("Try again", "small", lambda: self.retryRequested.emit())
+        statusrow = QHBoxLayout()
+        statusrow.addWidget(self.status, 1)
+        statusrow.addWidget(self.retry)
+        lay.addLayout(statusrow)
+
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("lyricsBox")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll.setFixedHeight(320)
+        self.body = QWidget()
+        self.body.setObjectName("lyricsBox")
+        self.lines_lay = QVBoxLayout(self.body)
+        self.lines_lay.setContentsMargins(0, 0, 8, 0)
+        self.lines_lay.setSpacing(2)
+        self.scroll.setWidget(self.body)
+        lay.addWidget(self.scroll)
+
+        search = QHBoxLayout()
+        self.query = QLineEdit()
+        self.query.setPlaceholderText("Wrong song? Type the artist and title")
+        self.query.returnPressed.connect(self._search)
+        search.addWidget(self.query, 1)
+        search.addWidget(_button("Search", "", self._search))
+        lay.addLayout(search)
+        credit = QLabel('Lyrics from <a href="https://lrclib.net" style="color:#2E9A72;">LRCLIB</a>, a free community database.')
+        credit.setObjectName("muted")
+        credit.setOpenExternalLinks(True)
+        lay.addWidget(credit)
+
+        self.lines: list[LyricLine] = []
+        self.times: list[int] = []
+        self.current = -1
+        self.show_loading()
+
+    def _search(self) -> None:
+        text = self.query.text().strip()
+        if text:
+            self.searchRequested.emit(text)
+
+    def _clear(self) -> None:
+        while self.lines_lay.count():
+            item = self.lines_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.lines, self.times, self.current = [], [], -1
+
+    def _set_status(self, text: str, retry: bool = False) -> None:
+        self.status.setText(text)
+        self.status.setVisible(bool(text))
+        self.retry.setVisible(retry)
+
+    def show_loading(self) -> None:
+        self._clear()
+        self._set_status("Looking for the lyrics…")
+        self.scroll.hide()
+
+    def show_error(self, msg: str) -> None:
+        self._clear()
+        self._set_status(msg, retry=True)
+        self.scroll.hide()
+
+    def show_result(self, result: "lyrics_mod.Lyrics") -> None:
+        self._clear()
+        if result.query and not self.query.text():
+            self.query.setText(result.query)
+        if result.status == lyrics_mod.INSTRUMENTAL:
+            self._set_status(f"\"{result.track}\" is an instrumental: there are no lyrics.")
+            self.scroll.hide()
+            return
+        if result.status != lyrics_mod.FOUND:
+            self._set_status("No lyrics found for this song. Try typing the artist and title below.")
+            self.scroll.hide()
+            return
+        if result.synced:
+            self._set_status(f"{result.artist} – {result.track}  ·  click a line to jump there")
+            for ms, text in result.synced:
+                line = LyricLine(ms, text)
+                line.clicked.connect(self.lineClicked)
+                self.lines_lay.addWidget(line)
+                self.lines.append(line)
+                self.times.append(ms)
+        else:
+            self._set_status(f"{result.artist} – {result.track}  ·  these lyrics aren't timed, so they won't follow the music")
+            plain = QLabel(result.plain)
+            plain.setObjectName("lyricsPlain")
+            plain.setWordWrap(True)
+            plain.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            self.lines_lay.addWidget(plain)
+        self.lines_lay.addStretch()
+        self.scroll.verticalScrollBar().setValue(0)
+        self.scroll.show()
+
+    def set_position(self, ms: int, duration: int) -> None:
+        self.time.setText(f"{_fmt_clock(ms)} / {_fmt_clock(duration)}")
+        if not self.times:
+            return
+        idx = bisect.bisect_right(self.times, ms + 150) - 1
+        if idx == self.current:
+            return
+        for i in (self.current, idx):
+            if 0 <= i < len(self.lines):
+                self.lines[i].setProperty("current", i == idx)
+                _repolish(self.lines[i])
+        self.current = idx
+        if idx >= 0 and self.isVisible():
+            line = self.lines[idx]
+            bar = self.scroll.verticalScrollBar()
+            bar.setValue(int(line.y() - self.scroll.viewport().height() / 2 + line.height() / 2))
+
+    def set_playing(self, stem: str, playing: bool) -> None:
+        self.play_buttons[stem].setIcon(_transport_icon(playing))
 
 
 class DropZone(QFrame):
@@ -789,14 +990,46 @@ class MainPage(QWidget):
         head.addLayout(titles, 1)
         q.addLayout(head)
 
+        tabs = QHBoxLayout()
+        tabs.setSpacing(0)
+        self.tab_buttons: list[QPushButton] = []
+        for i, name in enumerate(("Tracks", "Lyrics")):
+            b = _button(name, "tab", lambda _=False, i=i: self.show_tab(i))
+            b.setCheckable(True)
+            self.tab_buttons.append(b)
+            tabs.addWidget(b)
+        tabs.addStretch()
+        q.addLayout(tabs)
+        q.addSpacing(-12)
+        q.addWidget(_divider())
+
+        self.tabs = QStackedWidget()
+        tracks_page = QWidget()
+        tl = QVBoxLayout(tracks_page)
+        tl.setContentsMargins(0, 4, 0, 0)
+        tl.setSpacing(16)
         self.rows: dict[str, TrackRow] = {}
         for stem, label in STEMS:
             row = TrackRow(stem, label)
             row.started.connect(self._on_row_started)
             row.saveClicked.connect(self.save_stem)
             row.error.connect(self._show_result_error)
+            row.position.connect(lambda ms, r=row: self._on_row_position(r, ms))
+            row.playingChanged.connect(lambda on, s=stem: self.lyrics_view.set_playing(s, on))
             self.rows[stem] = row
-            q.addWidget(row)
+            tl.addWidget(row)
+        tl.addStretch()
+        self.tabs.addWidget(tracks_page)
+
+        self.lyrics_view = LyricsView()
+        self.lyrics_view.playRequested.connect(lambda stem: self.rows[stem].toggle())
+        self.lyrics_view.lineClicked.connect(self._on_lyric_clicked)
+        self.lyrics_view.searchRequested.connect(lambda q: self._fetch_lyrics(query=q))
+        self.lyrics_view.retryRequested.connect(lambda: self._fetch_lyrics())
+        self.tabs.addWidget(self.lyrics_view)
+        q.addWidget(self.tabs)
+        self.active_stem = "instrumental"
+        self.show_tab(0)
 
         q.addWidget(_divider())
         self.result_msg = _message("success")
@@ -980,13 +1213,75 @@ class MainPage(QWidget):
         )
         for stem, row in self.rows.items():
             row.load(entry.stem_path(stem), entry.waveform(stem), int(entry.duration_s * 1000))
+        self.active_stem = "instrumental"
+        self.lyrics_view.query.clear()
+        self.lyrics_view.set_position(0, int(entry.duration_s * 1000))
+        self._fetch_lyrics()
         self._show_mode("result")
 
     def close_entry(self) -> None:
         """Forget the shown song (it was deleted) and go back to the input."""
         self.new_split()
 
+    def show_tab(self, i: int) -> None:
+        self.tabs.setCurrentIndex(i)
+        # A QStackedWidget is as tall as its tallest page; only count the visible one.
+        for j in range(self.tabs.count()):
+            vertical = QSizePolicy.Preferred if j == i else QSizePolicy.Ignored
+            self.tabs.widget(j).setSizePolicy(QSizePolicy.Preferred, vertical)
+        self.tabs.adjustSize()
+        for j, b in enumerate(self.tab_buttons):
+            b.setChecked(j == i)
+
+    def _fetch_lyrics(self, query: str | None = None) -> None:
+        entry = self.entry
+        if entry is None:
+            return
+        if query is None:
+            cached = entry.cached_lyrics()
+            if cached is not None:
+                self.lyrics_view.show_result(cached)
+                return
+
+        def run():
+            if query:
+                return lyrics_mod.search(query, entry.duration_s)
+            return lyrics_mod.find(entry.title, entry.duration_s, artist=entry.artist,
+                                   track=entry.track, channel=entry.channel)
+
+        self.lyrics_view.show_loading()
+        call = BackgroundCall(self)
+        call.succeeded.connect(lambda result, e=entry: self._on_lyrics(e, result))
+        call.failed.connect(lambda msg, e=entry: self._on_lyrics_failed(e, msg))
+        call.succeeded.connect(call.deleteLater)
+        call.failed.connect(call.deleteLater)
+        call.start(run)
+
+    def _is_current(self, entry: Entry) -> bool:
+        return self.entry is not None and self.entry.folder == entry.folder
+
+    def _on_lyrics(self, entry: Entry, result: "lyrics_mod.Lyrics") -> None:
+        entry.save_lyrics(result)
+        if self._is_current(entry):
+            self.lyrics_view.show_result(result)
+            self._on_row_position(self.rows[self.active_stem], self.rows[self.active_stem].player.position())
+
+    def _on_lyrics_failed(self, entry: Entry, msg: str) -> None:
+        if self._is_current(entry):
+            self.lyrics_view.show_error(msg)
+
+    def _on_row_position(self, row: TrackRow, ms: int) -> None:
+        if row.stem == self.active_stem:
+            self.lyrics_view.set_position(int(ms), row.duration())
+
+    def _on_lyric_clicked(self, ms: int) -> None:
+        row = self.rows[self.active_stem]
+        row.seek(ms)
+        if not row.is_playing():
+            row.toggle()
+
     def _on_row_started(self, row: TrackRow) -> None:
+        self.active_stem = row.stem
         for other in self.rows.values():
             if other is not row:
                 other.pause()

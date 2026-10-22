@@ -15,7 +15,7 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +105,7 @@ class Separated:
     title: str
     vocals: np.ndarray
     instrumental: np.ndarray
+    tags: dict = field(default_factory=dict)  # artist / track / channel hints for lyrics
 
 
 def separate_source(source: str | Path, on_progress: ProgressCallback,
@@ -118,7 +119,7 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
     with tempfile.TemporaryDirectory(prefix="musisplit_") as tmp:
         if is_url:
             on_progress(Stage.DOWNLOADING, None, "Connecting to YouTube…")
-            path, title = youtube.download_audio(
+            path, title, tags = youtube.download_audio(
                 src, Path(tmp),
                 on_progress=lambda f: on_progress(Stage.DOWNLOADING, f, "Downloading audio…"),
                 cancel=cancel,
@@ -127,6 +128,8 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
             path = Path(src)
             check_local_file(path)
             title = path.stem
+            file_tags = audio.read_tags(path)
+            tags = {"artist": file_tags.get("artist", ""), "track": file_tags.get("title", ""), "channel": ""}
 
         on_progress(Stage.SEPARATING, None, "Reading audio…")
         mix = audio.decode(path)
@@ -147,14 +150,14 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
     )
     del mix
     vocals, instrumental = normalize_pair(vocals, instrumental)
-    return Separated(title=title, vocals=vocals, instrumental=instrumental)
+    return Separated(title=title, vocals=vocals, instrumental=instrumental, tags=tags)
 
 
 def save_to_library(sep: Separated, source: str | Path, on_progress: ProgressCallback,
                     cancel: threading.Event | None = None) -> library.Entry:
     """Exporting: encode both stems into the local history."""
     return library.add(
-        sep.vocals, sep.instrumental, sep.title, str(source).strip(),
+        sep.vocals, sep.instrumental, sep.title, str(source).strip(), tags=sep.tags,
         on_progress=lambda f, msg: on_progress(Stage.EXPORTING, f, msg),
         cancel=cancel,
     )
