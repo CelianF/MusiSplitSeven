@@ -49,14 +49,14 @@ log = logging.getLogger("musisplit")
 
 UNEXPECTED = "Something unexpected went wrong.\nDetails were saved to {log}."
 
-# Pastel green and cream, flat colours only.
-CREAM = "#FAF6EC"
-CARD = "#FFFDF7"
-SAND = "#F2ECDD"
-SAND_DARK = "#E9E1CE"
-BORDER = "#E6DDC8"
+# Pastel green background, near-white mint cards, flat colours only.
+BG = "#DCF0E4"
+CARD = "#F7FCF9"
+SAND = "#E7F4EC"
+SAND_DARK = "#D7EBDF"
+BORDER = "#C8E2D2"
 TEXT = "#2C3A31"
-MUTED = "#7C7666"
+MUTED = "#5F7768"
 # Accent: pastel emerald.
 GREEN = "#9FDFC4"
 GREEN_HOVER = "#88D6B5"
@@ -69,23 +69,23 @@ RED = "#9C4434"
 
 STYLE = """
 QWidget { color: @TEXT; font-size: 10pt; }
-QMainWindow, QScrollArea, #scrollBody, #historyList { background: @CREAM; }
+QMainWindow, QScrollArea, #scrollBody, #historyList { background: @BG; }
 QScrollArea { border: none; }
 #title { font-size: 20pt; font-weight: 700; color: @GREEN_DARK; }
 #subtitle { color: @MUTED; font-size: 10.5pt; }
 #card { background: @CARD; border: 1px solid @BORDER; border-radius: 14px; }
-#dropzone { background: @CREAM; border: 2px dashed #D8CDB2; border-radius: 12px; }
+#dropzone { background: @SAND; border: 2px dashed #A9D3BB; border-radius: 12px; }
 #dropzone[active="true"] { background: @GREEN_SOFT; border-color: @GREEN_MID; }
 #dropzone[filled="true"] { background: @GREEN_SOFT; border: 2px solid @GREEN_MID; }
 #dropTitle { font-size: 11.5pt; font-weight: 600; }
 #muted { color: @MUTED; }
-#orLabel { color: #A79F8B; font-weight: 600; }
+#orLabel { color: #89A596; font-weight: 600; }
 #divider { background: @BORDER; max-height: 1px; min-height: 1px; border: none; }
-QLineEdit { background: @CARD; border: 1px solid #DCD2BC; border-radius: 9px; padding: 9px 11px; font-size: 10.5pt; }
+QLineEdit { background: @CARD; border: 1px solid #BFDCCB; border-radius: 9px; padding: 9px 11px; font-size: 10.5pt; }
 QLineEdit:focus { border-color: @GREEN_MID; }
 QPushButton { background: @SAND; color: @TEXT; border: 1px solid @BORDER; border-radius: 9px; padding: 8px 16px; font-weight: 600; }
 QPushButton:hover { background: @SAND_DARK; }
-QPushButton:disabled { color: #B5AE9C; background: #F4F0E6; border-color: #EEE8DA; }
+QPushButton:disabled { color: #9DB5A8; background: #EDF6F0; border-color: #DCEDE3; }
 QPushButton#primary { background: @GREEN; color: @GREEN_DARK; border: 1px solid @GREEN; padding: 11px 22px; font-size: 11pt; }
 QPushButton#primary:hover { background: @GREEN_HOVER; border-color: @GREEN_HOVER; }
 QPushButton#primary:disabled { background: #D6EEE4; color: #86B5A2; border-color: #D6EEE4; }
@@ -94,11 +94,11 @@ QPushButton#danger:hover { background: @RED_SOFT; border-color: #EBCBBF; }
 QPushButton#small { padding: 6px 12px; font-size: 9.5pt; }
 QPushButton#play { background: @GREEN; border: none; border-radius: 21px; min-width: 42px; max-width: 42px; min-height: 42px; max-height: 42px; padding: 0; }
 QPushButton#play:hover { background: @GREEN_HOVER; }
-#stage { color: #ABA390; font-weight: 600; padding: 4px 10px; border-radius: 11px; background: @SAND; }
+#stage { color: #8AA597; font-weight: 600; padding: 4px 10px; border-radius: 11px; background: @SAND; }
 #stage[state="active"] { color: @GREEN_DARK; background: @GREEN; }
 #stage[state="done"] { color: @GREEN_DARK; background: @GREEN_SOFT; }
-#stage[state="skipped"] { color: #C9C2B1; background: #F6F2E8; text-decoration: line-through; }
-#arrow { color: #BDB59F; }
+#stage[state="skipped"] { color: #A9C2B5; background: #EEF7F1; text-decoration: line-through; }
+#arrow { color: #97B7A5; }
 #status { font-size: 10.5pt; }
 #sectionTitle { font-size: 13pt; font-weight: 700; }
 #pageTitle { font-size: 16pt; font-weight: 700; color: @GREEN_DARK; }
@@ -113,13 +113,13 @@ QPushButton#tab:hover { color: @TEXT; }
 QPushButton#tab:checked { color: @GREEN_DARK; border-bottom: 3px solid @GREEN_MID; }
 QPushButton#pill { padding: 6px 14px 6px 10px; border-radius: 15px; background: @GREEN_SOFT; color: @GREEN_DARK; border: 1px solid #C2E9D8; }
 QPushButton#pill:hover { background: #D3EFE2; }
-#lyricLine { color: #8E887A; font-size: 12pt; padding: 3px 8px; border-radius: 7px; }
+#lyricLine { color: #6E8679; font-size: 12pt; padding: 3px 8px; border-radius: 7px; }
 #lyricLine:hover { background: @SAND; }
 #lyricLine[current="true"] { color: @GREEN_DARK; font-weight: 700; background: @GREEN_SOFT; }
 #lyricsPlain { font-size: 11.5pt; padding: 4px 8px; }
 #lyricsBox { background: @CARD; border: none; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
-QScrollBar::handle:vertical { background: #DDD4BF; border-radius: 4px; min-height: 30px; }
+QScrollBar::handle:vertical { background: #B4D5C2; border-radius: 4px; min-height: 30px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
 for _name, _value in sorted(dict(globals()).items(), key=lambda kv: -len(kv[0])):
@@ -1644,10 +1644,10 @@ def _light_palette(app: QApplication) -> None:
     """Pin a light palette so Windows dark mode doesn't half-apply to the Fusion style."""
     pal = QPalette()
     for role, color in (
-        (QPalette.Window, CREAM), (QPalette.WindowText, TEXT), (QPalette.Base, CARD),
-        (QPalette.AlternateBase, CREAM), (QPalette.Text, TEXT), (QPalette.Button, SAND),
+        (QPalette.Window, BG), (QPalette.WindowText, TEXT), (QPalette.Base, CARD),
+        (QPalette.AlternateBase, BG), (QPalette.Text, TEXT), (QPalette.Button, SAND),
         (QPalette.ButtonText, TEXT), (QPalette.Highlight, GREEN), (QPalette.HighlightedText, GREEN_DARK),
-        (QPalette.ToolTipBase, CARD), (QPalette.ToolTipText, TEXT), (QPalette.PlaceholderText, "#A79F8B"),
+        (QPalette.ToolTipBase, CARD), (QPalette.ToolTipText, TEXT), (QPalette.PlaceholderText, "#89A596"),
     ):
         pal.setColor(role, QColor(color))
     app.setPalette(pal)
