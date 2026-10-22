@@ -19,7 +19,7 @@ from unittest import mock
 
 import numpy as np
 
-from musisplit import audio, model, pipeline, youtube
+from musisplit import audio, library, model, pipeline, spectrogram, youtube
 from musisplit.errors import Cancelled, NoInternetError, UserError
 from musisplit.paths import ffmpeg_exe
 from musisplit.separator import PEAK_TARGET, normalize_pair
@@ -278,6 +278,72 @@ class ModelDownloadTests(unittest.TestCase):
                 model.ensure_model()
 
 
+class SpectrogramTests(unittest.TestCase):
+    def tone(self, freq, seconds=3.0, amp=0.5):
+        t = np.arange(int(44100 * seconds)) / 44100
+        return np.stack([amp * np.sin(2 * np.pi * freq * t)] * 2).astype(np.float32)
+
+    def test_shape_and_loudness(self):
+        silent = np.zeros((2, 44100 * 3), np.float32)
+        v, i = spectrogram.compute_pair(self.tone(440), silent)
+        self.assertEqual(v.shape, (spectrogram.ROWS, spectrogram.COLUMNS))
+        self.assertEqual(v.dtype, np.uint8)
+        self.assertEqual(int(v.max()), 255)
+        self.assertEqual(int(i.max()), 0)  # shared scale: silence stays blank
+
+    def test_high_frequencies_on_top(self):
+        low, high = spectrogram.compute_pair(self.tone(100), self.tone(5000))
+        row = lambda img: int(np.argmax(img.mean(axis=1)))
+        self.assertLess(row(high), row(low))
+
+    def test_very_short_audio(self):
+        v, _ = spectrogram.compute_pair(self.tone(440, 0.01), self.tone(440, 0.01))
+        self.assertEqual(v.shape, (spectrogram.ROWS, spectrogram.COLUMNS))
+
+
+class LibraryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.env = mock.patch.dict(os.environ, {"MUSISPLIT_LIBRARY_DIR": str(Path(self.tmp.name) / "lib")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        self.tmp.cleanup()
+
+    def add(self, title):
+        x = np.zeros((2, 44100), np.float32)
+        return library.add(x, x, title, "https://youtu.be/abc")
+
+    def test_add_list_delete(self):
+        self.assertEqual(library.list_entries(), [])
+        a = self.add("First")
+        b = self.add("Second — é ✓")
+        entries = library.list_entries()
+        self.assertEqual([e.title for e in entries], ["Second — é ✓", "First"])
+        self.assertTrue(entries[0].from_youtube)
+        self.assertGreater(a.size_bytes(), 0)
+        library.delete(a)
+        self.assertEqual([e.folder for e in library.list_entries()], [b.folder])
+        library.delete_all()
+        self.assertEqual(library.list_entries(), [])
+
+    def test_broken_and_incomplete_folders_ignored(self):
+        self.add("Good")
+        root = library.library_dir()
+        (root / "garbage").mkdir()
+        (root / "badmeta").mkdir()
+        (root / "badmeta" / "meta.json").write_text("{not json")
+        (root / ".20260101-000000-abcdef.tmp").mkdir()
+        self.assertEqual([e.title for e in library.list_entries()], ["Good"])
+        library.clean_incomplete()
+        self.assertFalse((root / ".20260101-000000-abcdef.tmp").exists())
+
+    def test_missing_library_dir(self):
+        self.assertEqual(library.list_entries(), [])
+        library.delete_all()
+
+
 @unittest.skipUnless(HAVE_MODEL, "model not downloaded")
 class SeparationTests(unittest.TestCase):
     @classmethod
@@ -286,9 +352,12 @@ class SeparationTests(unittest.TestCase):
         cls.dir = Path(cls.tmp.name)
         cls.song = cls.dir / "My Song.wav"
         make_song(cls.song, 12)
+        cls.env = mock.patch.dict(os.environ, {"MUSISPLIT_LIBRARY_DIR": str(cls.dir / "library")})
+        cls.env.start()
 
     @classmethod
     def tearDownClass(cls):
+        cls.env.stop()
         cls.tmp.cleanup()
 
     def test_matches_demucs_onnx_reference_loop(self):
@@ -332,25 +401,62 @@ class SeparationTests(unittest.TestCase):
         out = self.dir / "cancelled"
         with self.assertRaises(Cancelled):
             pipeline.run_job(self.song, out, progress, cancel=ev)
-        # Nothing is written (not even the folder) until export.
+        # Nothing is written: no output folder, no history entry, no leftovers.
         self.assertFalse(out.exists())
+        before = {e.folder for e in library.list_entries()}
+        lib = library.library_dir()
+        self.assertFalse(any(p.name.endswith(".tmp") for p in lib.iterdir()) if lib.exists() else False)
+        self.assertEqual(before, {e.folder for e in library.list_entries()})
 
-    def test_separate_then_export_later(self):
+    def test_cancel_during_export_leaves_no_entry(self):
+        ev = threading.Event()
+        sep = pipeline.separate_source(self.song, lambda *a: None)
+        count = len(library.list_entries())
+
+        def progress(stage, frac, msg):
+            if stage is pipeline.Stage.EXPORTING and frac:
+                ev.set()
+
+        with self.assertRaises(Cancelled):
+            pipeline.save_to_library(sep, self.song, progress, cancel=ev)
+        self.assertEqual(len(library.list_entries()), count)
+        self.assertEqual([p for p in library.library_dir().iterdir() if p.name.startswith(".")], [])
+
+    def test_history_then_export_later(self):
         sep = pipeline.separate_source(self.song, lambda *a: None)
         self.assertEqual(sep.title, "My Song")
         self.assertEqual(sep.vocals.shape, sep.instrumental.shape)
+        stages = []
+        entry = pipeline.save_to_library(sep, self.song, lambda s, f, m: stages.append(s))
+        self.assertEqual(set(stages), {pipeline.Stage.EXPORTING})
+        self.assertEqual(entry.title, "My Song")
+        self.assertAlmostEqual(entry.duration_s, 12.0, delta=0.05)
+        self.assertEqual(entry.source, str(self.song))
+        for f in (entry.vocals, entry.instrumental, entry.mix):
+            self.assertAlmostEqual(duration_s(f), 12.0, delta=0.15)
+        self.assertEqual(entry.spectrogram("vocals").shape, (spectrogram.ROWS, spectrogram.COLUMNS))
+        self.assertIn(entry.folder, [e.folder for e in library.list_entries()])
+
         out = self.dir / "later"
-        res = pipeline.export(sep, out, lambda *a: None)
-        self.assertTrue(res.vocals.is_file() and res.instrumental.is_file())
+        res = pipeline.export(entry, out)
+        self.assertEqual(res.vocals.read_bytes(), entry.vocals.read_bytes())
+        self.assertEqual(res.instrumental.read_bytes(), entry.instrumental.read_bytes())
         # Exporting the same song again doesn't overwrite the first export.
-        again = pipeline.export(sep, out, lambda *a: None)
+        again = pipeline.export(entry, out)
         self.assertEqual(again.vocals.name, "My Song (2) - vocals.mp3")
+        # Deleting from history keeps the exported copies.
+        library.delete(entry)
+        self.assertTrue(res.vocals.is_file())
+        self.assertNotIn(entry.folder, [e.folder for e in library.list_entries()])
+        with self.assertRaisesRegex(UserError, "missing from the history"):
+            pipeline.export(entry, out)
 
 
 @unittest.skipUnless(NET_TESTS and HAVE_MODEL, "set MUSISPLIT_NET_TESTS=1 (and download the model)")
 class YouTubeTests(unittest.TestCase):
     def test_download_and_split(self):
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {"MUSISPLIT_LIBRARY_DIR": str(Path(d) / "lib")}):
             events = []
             res = pipeline.run_job("https://www.youtube.com/watch?v=jNQXAC9IVRw", Path(d),
                                    lambda s, f, m: events.append(s))

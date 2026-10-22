@@ -1,13 +1,17 @@
 """Download → Separate → Export, with no UI dependency.
 
-The UI calls :func:`separate_source` and later :func:`export` from worker
-threads (so the user can listen in between); the CLI calls :func:`run_job`,
-which does both. Progress is reported through a callback.
+The UI calls :func:`separate_source` then :func:`save_to_library` from a
+worker thread; every split is kept in the local history (see ``library``),
+where the user can listen to it and later :func:`export` (copy) the MP3s to a
+folder. The CLI calls :func:`run_job`, which does all three. Progress is
+reported through a callback.
 """
 from __future__ import annotations
 
 import enum
+import errno
 import re
+import shutil
 import tempfile
 import threading
 from collections.abc import Callable
@@ -16,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, youtube
+from . import audio, library, youtube
 from .errors import UserError
 from .model import is_model_ready, model_path
 from .separator import Separator, normalize_pair
@@ -146,31 +150,57 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
     return Separated(title=title, vocals=vocals, instrumental=instrumental)
 
 
-def export(sep: Separated, out_dir: Path, on_progress: ProgressCallback,
-           cancel: threading.Event | None = None) -> JobResult:
-    """Exporting: write ``<title> - vocals.mp3`` and ``<title> - instrumental.mp3`` to ``out_dir``."""
+def save_to_library(sep: Separated, source: str | Path, on_progress: ProgressCallback,
+                    cancel: threading.Event | None = None) -> library.Entry:
+    """Exporting: encode both stems (and their mix) into the local history."""
+    return library.add(
+        sep.vocals, sep.instrumental, sep.title, str(source).strip(),
+        on_progress=lambda f, msg: on_progress(Stage.EXPORTING, f, msg),
+        cancel=cancel,
+    )
+
+
+def export(entry: library.Entry, out_dir: Path) -> JobResult:
+    """Copy ``<title> - vocals.mp3`` and ``<title> - instrumental.mp3`` from the history to ``out_dir``."""
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        raise UserError(f"Couldn't create the output folder {out_dir}.\n{exc.strerror}") from exc
+        raise UserError(f"Couldn't create the folder {out_dir}.\n{exc.strerror}") from exc
 
-    vocals_path, inst_path = output_paths(out_dir, sep.title)
-    on_progress(Stage.EXPORTING, 0.0, "Saving vocals…")
-    audio.encode_mp3(sep.vocals, vocals_path, title=f"{sep.title} (vocals)",
-                     on_progress=lambda f: on_progress(Stage.EXPORTING, f / 2, "Saving vocals…"),
-                     cancel=cancel)
+    vocals_path, inst_path = output_paths(out_dir, entry.title)
+    done: list[Path] = []
     try:
-        audio.encode_mp3(sep.instrumental, inst_path, title=f"{sep.title} (instrumental)",
-                         on_progress=lambda f: on_progress(Stage.EXPORTING, 0.5 + f / 2, "Saving instrumental…"),
-                         cancel=cancel)
+        for src, dst in ((entry.vocals, vocals_path), (entry.instrumental, inst_path)):
+            tmp = dst.with_name(dst.name + ".part")
+            try:
+                shutil.copyfile(src, tmp)
+                tmp.replace(dst)
+            except FileNotFoundError as exc:
+                if not src.exists():
+                    raise UserError(
+                        f"The files for \"{entry.title}\" are missing from the history.\nPlease split it again."
+                    ) from exc
+                raise UserError(f"Couldn't save to {out_dir}.\n{exc.strerror}") from exc
+            except OSError as exc:
+                tmp.unlink(missing_ok=True)
+                if exc.errno == errno.ENOSPC:
+                    raise UserError(f"The disk is full. Couldn't save \"{dst.name}\".") from exc
+                raise UserError(
+                    f"Couldn't save \"{dst.name}\" in {out_dir}.\n"
+                    "Check that the folder exists and you can write to it."
+                ) from exc
+            done.append(dst)
     except BaseException:
-        vocals_path.unlink(missing_ok=True)
+        for p in done:
+            p.unlink(missing_ok=True)
         raise
-    on_progress(Stage.EXPORTING, 1.0, "Done")
-    return JobResult(title=sep.title, vocals=vocals_path, instrumental=inst_path)
+    return JobResult(title=entry.title, vocals=vocals_path, instrumental=inst_path)
 
 
 def run_job(source: str | Path, out_dir: Path, on_progress: ProgressCallback,
             cancel: threading.Event | None = None) -> JobResult:
-    """Split ``source`` (a local audio file or a YouTube URL) into two MP3s in ``out_dir``."""
-    return export(separate_source(source, on_progress, cancel), out_dir, on_progress, cancel)
+    """Split ``source`` (a local audio file or a YouTube URL), keep it in the history, and copy the MP3s to ``out_dir``."""
+    sep = separate_source(source, on_progress, cancel)
+    entry = save_to_library(sep, source, on_progress, cancel)
+    del sep
+    return export(entry, out_dir)

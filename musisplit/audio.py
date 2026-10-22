@@ -4,7 +4,6 @@ from __future__ import annotations
 import subprocess
 import tempfile
 import threading
-import wave
 from collections.abc import Callable
 from pathlib import Path
 
@@ -46,16 +45,6 @@ def decode(path: Path) -> np.ndarray:
     audio = np.frombuffer(raw, dtype=np.float32)
     audio = audio[: len(audio) - len(audio) % CHANNELS]
     return np.ascontiguousarray(audio.reshape(-1, CHANNELS).T)
-
-
-def write_wav(audio: np.ndarray, dest: Path) -> None:
-    """Write ``(2, samples)`` float32 audio as 16-bit PCM WAV (used for in-app preview)."""
-    pcm = (np.clip(audio.T, -1.0, 1.0) * 32767.0).astype("<i2")
-    with wave.open(str(dest), "wb") as w:
-        w.setnchannels(CHANNELS)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        w.writeframes(pcm.tobytes())
 
 
 def encode_mp3(audio: np.ndarray, dest: Path, *, title: str = "",

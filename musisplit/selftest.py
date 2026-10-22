@@ -35,9 +35,11 @@ def main(argv: list[str]) -> int:
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    tmp = Path(tempfile.mkdtemp(prefix="musisplit_selftest_"))
+    # Keep the test split out of the real history.
+    os.environ["MUSISPLIT_LIBRARY_DIR"] = str(tmp / "library")
     from . import __version__, audio, model, paths, pipeline, youtube
 
-    tmp = Path(tempfile.mkdtemp(prefix="musisplit_selftest_"))
     song = tmp / "Self Test.wav"
 
     lines.append(f"MusiSplitSeven {__version__} frozen={paths.IS_FROZEN} exe={sys.executable}")
@@ -78,32 +80,51 @@ def main(argv: list[str]) -> int:
             assert abs(secs - 10) < 0.2, (p, secs)
         return ", ".join(sorted(p.name for p in out.iterdir()))
 
-    def preview_player():
-        from PySide6.QtCore import QCoreApplication, QUrl
-        from PySide6.QtMultimedia import QMediaPlayer
+    def history():
+        from . import library
+        entries = library.list_entries()
+        assert len(entries) == 1, entries
+        e = entries[0]
+        for f in (e.vocals, e.instrumental, e.mix):
+            assert f.is_file(), f
+        spec = e.spectrogram("vocals")
+        assert spec is not None and spec.dtype.name == "uint8", spec
+        return f"{e.title!r} {e.size_bytes()} bytes, spectrogram {spec.shape}"
 
-        wav = tmp / "preview.wav"
-        audio.write_wav(audio.decode(song), wav)
-        player = QMediaPlayer()
-        player.setSource(QUrl.fromLocalFile(str(wav)))
+    def stem_player():
+        from PySide6.QtCore import QCoreApplication
+
+        from . import library
+        from .gui import StemPlayer
+        player = StemPlayer()
+        player.load(library.list_entries()[0])
         deadline = time.monotonic() + 15
         while player.duration() <= 0 and time.monotonic() < deadline:
             QCoreApplication.processEvents()
             time.sleep(0.05)
         duration = player.duration()
-        assert duration > 9000, f"duration={duration} error={player.errorString()}"
-        player.setSource(QUrl())
+        assert duration > 9000, f"duration={duration}"
+        player.set_muted("instrumental", True)
+        assert player.audible() == "vocals"
+        player.unload()
         return f"duration={duration}ms"
 
     def main_window():
+        from . import library
         from .gui import MainWindow
         win = MainWindow()
         win.show()
         app.processEvents()
         page = "main" if win.stack.currentWidget() is win.main_page else "setup"
-        win.main_page.drop_preview()
+        win.main_page.load_entry(library.list_entries()[0])
+        app.processEvents()
+        shot = win.grab()
+        win.show_history()
+        app.processEvents()
+        rows = len(win.history_page.entries)
+        win.main_page.close_entry()
         win.hide()
-        return f"page={page} icon={not app.windowIcon().isNull()}"
+        return f"page={page} icon={not app.windowIcon().isNull()} history_rows={rows} shot={shot.width()}x{shot.height()}"
 
     def youtube_download():
         path, title = youtube.download_audio("https://www.youtube.com/watch?v=jNQXAC9IVRw", tmp)
@@ -117,7 +138,8 @@ def main(argv: list[str]) -> int:
     check("music folder", music_dir)
     check("yt-dlp import", youtube_module)
     check("separate + export", separation)
-    check("preview player (QtMultimedia)", preview_player)
+    check("history entry", history)
+    check("stem player (QtMultimedia)", stem_player)
     check("main window", main_window)
     if "--net" in argv:
         # Not counted as a failure: YouTube often blocks CI machines as bots.

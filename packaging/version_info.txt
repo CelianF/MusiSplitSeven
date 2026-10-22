@@ -1,8 +1,8 @@
 # Windows file version resource for PyInstaller. Keep in sync with musisplit/__init__.py.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(0, 1, 0, 0),
-    prodvers=(0, 1, 0, 0),
+    filevers=(0, 1, 1, 0),
+    prodvers=(0, 1, 1, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -14,11 +14,11 @@ VSVersionInfo(
     StringFileInfo([
       StringTable('040904B0', [
         StringStruct('FileDescription', 'MusiSplitSeven - split songs into vocals and instrumental'),
-        StringStruct('FileVersion', '0.1.0'),
+        StringStruct('FileVersion', '0.1.1'),
         StringStruct('InternalName', 'MusiSplitSeven'),
         StringStruct('OriginalFilename', 'MusiSplitSeven.exe'),
         StringStruct('ProductName', 'MusiSplitSeven'),
-        StringStruct('ProductVersion', '0.1.0'),
+        StringStruct('ProductVersion', '0.1.1'),
       ])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])

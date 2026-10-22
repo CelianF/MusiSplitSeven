@@ -1,8 +1,9 @@
 # MusiSplitSeven
 
 A small Windows app that splits a song into two tracks: **vocals** and
-**instrumental**. Give it an audio file or a YouTube link, listen to the result
-in the app, then save two MP3s.
+**instrumental**. Give it an audio file or a YouTube link, listen to both tracks
+in the app, then save them as two MP3s. Every split is kept in **History** so
+you can come back to it later.
 
 Everything runs on your own computer. Nothing is uploaded anywhere.
 
@@ -30,15 +31,31 @@ only). It is stored in `%APPDATA%\StemSplit\models`.
 2. Click **Split song**. The progress bar goes through
    *Downloading → Separating → Exporting*. Separating takes the longest: a few
    minutes per song on an average laptop. You can keep using the computer.
-3. **Listen**. Switch between *Vocals* and *Instrumental* while it plays.
+3. **Listen.** The vocals and instrumental are shown on top of each other, each
+   with a picture of its sound (a spectrogram). Press play to hear the full
+   song. Click **Mute** on one track to hear only the other. Click anywhere on
+   the tracks to jump to that point.
 4. Choose where to save (the default is `Music\StemSplit`), then click
    **Save MP3s**. You get:
    - `<song title> - vocals.mp3`
    - `<song title> - instrumental.mp3`
-5. Click **Open output folder** to see the files.
+5. Click **Open folder** to see the files.
 
 If a file with the same name already exists, the new one is numbered
 (`Song (2) - vocals.mp3`), so nothing is overwritten.
+
+### History
+
+Every song you split is kept on your computer, so you can listen to it again
+or save it again later without re-splitting. Click **History** (top right) to
+see them all:
+
+- **Open** loads a song back into the player.
+- **Delete** removes one song. **Delete all** clears the whole history.
+
+Deleting from History never touches MP3s you already saved to a folder. The
+history uses about 7 MB per minute of music. It lives in
+`%APPDATA%\StemSplit\library`.
 
 ### If something goes wrong
 
@@ -71,8 +88,12 @@ Every push to `main` (and every `v*` tag) runs
    opens the window. It also tries a YouTube download, but only warns if that
    fails, because YouTube often blocks CI machines.
 6. zips the build and uploads it as an artifact
+7. for a `v*` tag (for example `v0.1.1`), also publishes a GitHub Release with
+   the zip. The tag must match `__version__` in `musisplit/__init__.py`.
 
-To get the zip, open the **Actions** tab, select the latest run, and download
+To release a new version, bump `__version__` (and `packaging/version_info.txt`),
+then push a tag: `git tag v0.1.2 && git push origin v0.1.2`. The zip then shows
+up under **Releases**. For untagged builds, open the **Actions** tab, select the latest run, and download
 the artifact at the bottom of the page. To start a build by hand, use
 **Run workflow** (the workflow has `workflow_dispatch` enabled).
 
@@ -104,6 +125,7 @@ environment variables:
 | Variable | Purpose |
 |---|---|
 | `MUSISPLIT_MODEL_DIR` | use a different model folder (tests, CI) |
+| `MUSISPLIT_LIBRARY_DIR` | use a different History folder |
 | `MUSISPLIT_FFMPEG` | path to a specific ffmpeg binary |
 | `MUSISPLIT_NET_TESTS=1` | also run the YouTube tests |
 
@@ -120,7 +142,9 @@ The app icon is generated from `assets/icon_source.jpg` by
 | `musisplit/audio.py` | decode any input to 44.1 kHz stereo float, and encode 320 kbps MP3, both with the bundled ffmpeg |
 | `musisplit/model.py` | first-launch model download: pinned URL, SHA-256 check, resumes partial downloads |
 | `musisplit/separator.py` | runs the `htdemucs` ONNX model in 7.8 s chunks with overlap-add; vocals = stem 3, instrumental = drums + bass + other |
-| `musisplit/pipeline.py` | Download → Separate → Export, with no UI code |
+| `musisplit/library.py` | the History: each split is kept as MP3s plus spectrograms, written atomically |
+| `musisplit/spectrogram.py` | log-frequency spectrograms for the player view (numpy only) |
+| `musisplit/pipeline.py` | Download → Separate → Export (into History), then copy to a folder; no UI code |
 | `musisplit/gui.py` | PySide6 window; all work runs on background threads |
 
 **Model.** The single-file [`htdemucs`](https://huggingface.co/StemSplitio/htdemucs-onnx)
@@ -133,6 +157,11 @@ above 0.99 with the matching source in a test mix built from known parts.
 **Memory.** onnxruntime's default graph optimizations push peak RAM to
 about 3.8 GB. The app turns them off and disables memory-pattern planning,
 which brings the peak down to about 1.6 GB and costs about 8% in speed.
+
+**Playback.** The History also stores a full mix of the two stems. Three
+players run in lockstep (mix, vocals, instrumental), and only the one that
+matches the mute buttons is audible. Two separate players playing at once could
+drift apart by a few milliseconds; this way you always hear a single file.
 
 **Volume.** Both stems are scaled by the same gain (only when needed), so
 neither clips and they still add back up to the original song.

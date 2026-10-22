@@ -1,88 +1,121 @@
 """PySide6 single-window UI. All heavy work runs on QThreads.
 
-Flow: pick a file or paste a YouTube link → Split (Downloading → Separating)
-→ listen to both stems in the built-in player → Save MP3s (Exporting).
+Flow: pick a file or paste a YouTube link → Split (Downloading → Separating →
+Exporting into the local history) → listen to the stacked vocal and
+instrumental tracks → Save MP3s to a folder. Every split stays in History
+until the user deletes it.
 """
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPalette
+import numpy as np
+from PySide6.QtCore import QObject, QPointF, QRectF, QSettings, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import (
+    QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPainterPath, QPalette, QPen, QPixmap,
+    QPolygonF,
+)
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
-    QApplication, QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSlider,
-    QStackedWidget, QStyle, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, __version__
-from .audio import SUPPORTED_EXTENSIONS, write_wav
+from . import APP_NAME, __version__, library
+from .audio import SUPPORTED_EXTENSIONS
 from .errors import Cancelled, UserError
+from .library import Entry
 from .model import MODEL_SIZE, ensure_model, is_model_ready
 from .paths import IS_FROZEN, IS_WINDOWS, SUBPROCESS_FLAGS, _bundle_dir, app_data_dir, default_output_dir
-from .pipeline import JobResult, Separated, Stage, export, separate_source
+from .pipeline import JobResult, Stage, export, save_to_library, separate_source
 from .youtube import is_youtube_url
 
 log = logging.getLogger("musisplit")
 
 UNEXPECTED = "Something unexpected went wrong.\nDetails were saved to {log}."
-PREVIEW_PREFIX = "musisplit_preview_"
+
+# Pastel green and cream, flat colours only.
+CREAM = "#FAF6EC"
+CARD = "#FFFDF7"
+SAND = "#F2ECDD"
+SAND_DARK = "#E9E1CE"
+BORDER = "#E6DDC8"
+TEXT = "#2C3A31"
+MUTED = "#7C7666"
+GREEN = "#A9D4B6"
+GREEN_HOVER = "#98CAA7"
+GREEN_SOFT = "#E6F2E8"
+GREEN_MID = "#7FB893"
+GREEN_DARK = "#2F5B45"
+RED_SOFT = "#F6E2DA"
+RED = "#9C4434"
 
 STYLE = """
-QWidget { color: #1d1d2b; font-size: 10pt; }
-QMainWindow, #page, QScrollArea, #scrollBody { background: #f4f5fb; }
+QWidget { color: @TEXT; font-size: 10pt; }
+QMainWindow, QScrollArea, #scrollBody, #historyList { background: @CREAM; }
 QScrollArea { border: none; }
-#title { font-size: 20pt; font-weight: 700; color: #1d1d2b; }
-#subtitle { color: #6b6f85; font-size: 10.5pt; }
-#card { background: white; border: 1px solid #e3e5f0; border-radius: 14px; }
-#dropzone { background: #f8f8fe; border: 2px dashed #c9cbe0; border-radius: 12px; }
-#dropzone[active="true"] { background: #efeaff; border-color: #7c5cff; }
-#dropzone[filled="true"] { background: #f1fbf4; border: 2px solid #9ad7ad; }
+#title { font-size: 20pt; font-weight: 700; color: @GREEN_DARK; }
+#subtitle { color: @MUTED; font-size: 10.5pt; }
+#card { background: @CARD; border: 1px solid @BORDER; border-radius: 14px; }
+#dropzone { background: @CREAM; border: 2px dashed #D8CDB2; border-radius: 12px; }
+#dropzone[active="true"] { background: @GREEN_SOFT; border-color: @GREEN_MID; }
+#dropzone[filled="true"] { background: @GREEN_SOFT; border: 2px solid @GREEN; }
 #dropTitle { font-size: 11.5pt; font-weight: 600; }
-#muted { color: #6b6f85; }
-#orLabel { color: #9a9db3; font-weight: 600; }
-#divider { background: #e3e5f0; max-height: 1px; min-height: 1px; border: none; }
-QLineEdit { background: white; border: 1px solid #d5d7e6; border-radius: 9px; padding: 9px 11px; font-size: 10.5pt; }
-QLineEdit:focus { border-color: #7c5cff; }
-QPushButton { background: white; border: 1px solid #d5d7e6; border-radius: 9px; padding: 8px 16px; font-weight: 600; }
-QPushButton:hover { background: #f1f1f8; }
-QPushButton:disabled { color: #a9abbd; background: #f4f4f8; }
-QPushButton#primary { background: #6c4dff; color: white; border: none; padding: 12px 22px; font-size: 11.5pt; }
-QPushButton#primary:hover { background: #5b3df0; }
-QPushButton#primary:disabled { background: #c6bdf6; color: #f4f2ff; }
-QPushButton#segment { border-radius: 0; padding: 7px 18px; color: #4a4d63; }
-QPushButton#segment[pos="left"] { border-top-left-radius: 9px; border-bottom-left-radius: 9px; }
-QPushButton#segment[pos="right"] { border-top-right-radius: 9px; border-bottom-right-radius: 9px; border-left: none; }
-QPushButton#segment:checked { background: #6c4dff; color: white; border-color: #6c4dff; }
-QPushButton#play { border-radius: 22px; min-width: 44px; max-width: 44px; min-height: 44px; max-height: 44px; padding: 0; background: #6c4dff; border: none; }
-QPushButton#play:hover { background: #5b3df0; }
-QSlider::groove:horizontal { height: 6px; background: #e4e6f1; border-radius: 3px; }
-QSlider::sub-page:horizontal { background: #7c5cff; border-radius: 3px; }
-QSlider::handle:horizontal { background: white; border: 2px solid #6c4dff; width: 14px; height: 14px; margin: -6px 0; border-radius: 9px; }
-QProgressBar { background: #eceef6; border: none; border-radius: 6px; height: 12px; text-align: center; }
-QProgressBar::chunk { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c5cff, stop:1 #3e8bff); border-radius: 6px; }
-#stage { color: #a9abbd; font-weight: 600; padding: 4px 10px; border-radius: 11px; background: #f1f2f7; }
-#stage[state="active"] { color: white; background: #6c4dff; }
-#stage[state="done"] { color: #1f8a4c; background: #e3f6ea; }
-#stage[state="skipped"] { color: #c3c5d4; background: #f6f6fa; text-decoration: line-through; }
-#arrow { color: #b9bbcc; }
+#muted { color: @MUTED; }
+#orLabel { color: #A79F8B; font-weight: 600; }
+#divider { background: @BORDER; max-height: 1px; min-height: 1px; border: none; }
+QLineEdit { background: @CARD; border: 1px solid #DCD2BC; border-radius: 9px; padding: 9px 11px; font-size: 10.5pt; }
+QLineEdit:focus { border-color: @GREEN_MID; }
+QPushButton { background: @SAND; color: @TEXT; border: 1px solid @BORDER; border-radius: 9px; padding: 8px 16px; font-weight: 600; }
+QPushButton:hover { background: @SAND_DARK; }
+QPushButton:disabled { color: #B5AE9C; background: #F4F0E6; border-color: #EEE8DA; }
+QPushButton#primary { background: @GREEN; color: @GREEN_DARK; border: 1px solid @GREEN; padding: 11px 22px; font-size: 11pt; }
+QPushButton#primary:hover { background: @GREEN_HOVER; border-color: @GREEN_HOVER; }
+QPushButton#primary:disabled { background: #D9E9DD; color: #8FAF9B; border-color: #D9E9DD; }
+QPushButton#danger { color: @RED; }
+QPushButton#danger:hover { background: @RED_SOFT; border-color: #EBCBBF; }
+QPushButton#small { padding: 6px 12px; font-size: 9.5pt; }
+QPushButton#play { background: @GREEN; border: none; border-radius: 23px; min-width: 46px; max-width: 46px; min-height: 46px; max-height: 46px; padding: 0; }
+QPushButton#play:hover { background: @GREEN_HOVER; }
+QPushButton#play:disabled { background: #D9E9DD; }
+QPushButton#laneMute { padding: 4px 10px; font-size: 9pt; border-radius: 7px; background: @GREEN_SOFT; color: @GREEN_DARK; border: 1px solid #CFE5D5; }
+QPushButton#laneMute:checked { background: @SAND; color: @MUTED; border-color: @BORDER; }
+QProgressBar { background: @SAND; border: none; border-radius: 6px; height: 12px; text-align: center; }
+QProgressBar::chunk { background: @GREEN_MID; border-radius: 6px; }
+#stage { color: #ABA390; font-weight: 600; padding: 4px 10px; border-radius: 11px; background: @SAND; }
+#stage[state="active"] { color: @GREEN_DARK; background: @GREEN; }
+#stage[state="done"] { color: @GREEN_DARK; background: @GREEN_SOFT; }
+#stage[state="skipped"] { color: #C9C2B1; background: #F6F2E8; text-decoration: line-through; }
+#arrow { color: #BDB59F; }
 #status { font-size: 10.5pt; }
-#sectionTitle { font-size: 11.5pt; font-weight: 600; }
-#time { color: #6b6f85; font-family: "Segoe UI", sans-serif; }
-#error { background: #fdecec; color: #a12626; border: 1px solid #f3c4c4; border-radius: 10px; padding: 10px 12px; }
-#success { background: #e9f8ef; color: #1f6b3d; border: 1px solid #bfe6cd; border-radius: 10px; padding: 10px 12px; }
+#sectionTitle { font-size: 12pt; font-weight: 700; }
+#pageTitle { font-size: 16pt; font-weight: 700; color: @GREEN_DARK; }
+#time { color: @MUTED; font-size: 10.5pt; }
+#error { background: @RED_SOFT; color: @RED; border: 1px solid #EBCBBF; border-radius: 10px; padding: 10px 12px; }
+#success { background: @GREEN_SOFT; color: @GREEN_DARK; border: 1px solid #CFE5D5; border-radius: 10px; padding: 10px 12px; }
+#historyRow { background: @CARD; border: 1px solid @BORDER; border-radius: 12px; }
+#historyRow[current="true"] { border: 2px solid @GREEN; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: #DDD4BF; border-radius: 4px; min-height: 30px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
+for _name, _value in sorted(dict(globals()).items(), key=lambda kv: -len(kv[0])):
+    if _name.isupper() and isinstance(_value, str) and _value.startswith("#"):
+        STYLE = STYLE.replace(f"@{_name}", _value)
+
+# Spectrogram colour ramps (low → high energy), one shade of green per stem.
+RAMPS = {
+    "vocals": [CARD, "#DCEFE1", "#9FCFAE", "#5C9A75", "#24493A"],
+    "instrumental": [CARD, "#E6EFD6", "#BDD59C", "#7E9B57", "#43592C"],
+}
 
 
 def _repolish(w: QWidget) -> None:
@@ -98,9 +131,59 @@ def _fmt_duration(seconds: float) -> str:
     return f"about {minutes} minute{'s' if minutes != 1 else ''}"
 
 
-def _fmt_clock(ms: int) -> str:
-    s = max(0, ms) // 1000
+def _fmt_clock(ms: float) -> str:
+    s = max(0, int(ms)) // 1000
     return f"{s // 60}:{s % 60:02d}"
+
+
+def _fmt_size(n: int) -> str:
+    return f"{n / 1e6:.0f} MB" if n >= 1e6 else f"{n / 1e3:.0f} KB"
+
+
+def _color_table(stops: list[str]) -> list[int]:
+    cols = [QColor(c) for c in stops]
+    table = []
+    for i in range(256):
+        x = i / 255 * (len(cols) - 1)
+        a, b = cols[int(x)], cols[min(int(x) + 1, len(cols) - 1)]
+        t = x - int(x)
+        table.append(QColor(
+            round(a.red() + (b.red() - a.red()) * t),
+            round(a.green() + (b.green() - a.green()) * t),
+            round(a.blue() + (b.blue() - a.blue()) * t),
+        ).rgb())
+    return table
+
+
+_TABLES = {stem: _color_table(stops) for stem, stops in RAMPS.items()}
+
+
+def spectrogram_image(data: np.ndarray | None, stem: str) -> QImage | None:
+    if data is None or data.ndim != 2:
+        return None
+    data = np.ascontiguousarray(data, dtype=np.uint8)
+    rows, cols = data.shape
+    img = QImage(data.tobytes(), cols, rows, cols, QImage.Format_Indexed8)
+    img.setColorTable(_TABLES[stem])
+    return img.copy()
+
+
+def _transport_icon(playing: bool) -> QIcon:
+    size = 22
+    pm = QPixmap(size * 2, size * 2)
+    pm.setDevicePixelRatio(2)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(GREEN_DARK))
+    if playing:
+        p.drawRoundedRect(QRectF(5, 4, 4.5, 14), 1.5, 1.5)
+        p.drawRoundedRect(QRectF(12.5, 4, 4.5, 14), 1.5, 1.5)
+    else:
+        p.drawPolygon(QPolygonF([QPointF(7, 4), QPointF(18, 11), QPointF(7, 18)]))
+    p.end()
+    return QIcon(pm)
 
 
 # --------------------------------------------------------------------------- workers
@@ -156,40 +239,263 @@ class JobWorker(QThread):
             self.failed.emit(UNEXPECTED.format(log=log_path()))
 
 
-class Preview:
-    """A separated song plus the temporary WAV files the player reads."""
-
-    def __init__(self, sep: Separated, folder: Path) -> None:
-        self.sep = sep
-        self.folder = folder
-        self.vocals_wav = folder / "vocals.wav"
-        self.instrumental_wav = folder / "instrumental.wav"
-        self.saved: JobResult | None = None
-
-
-def separate_with_preview(source: str):
-    def run(progress, cancel) -> Preview:
+def split_into_library(source: str) -> Callable:
+    def run(progress, cancel) -> Entry:
         sep = separate_source(source, progress, cancel)
-        progress(Stage.SEPARATING, None, "Preparing the preview…")
-        folder = Path(tempfile.mkdtemp(prefix=PREVIEW_PREFIX))
-        preview = Preview(sep, folder)
-        try:
-            write_wav(sep.vocals, preview.vocals_wav)
-            write_wav(sep.instrumental, preview.instrumental_wav)
-        except OSError as exc:
-            shutil.rmtree(folder, ignore_errors=True)
-            raise UserError(f"Couldn't prepare the preview: {exc.strerror or exc}") from exc
-        return preview
+        return save_to_library(sep, source, progress, cancel)
     return run
 
 
-def _clean_stale_previews() -> None:
-    """Remove preview folders left behind by a crash or a locked file."""
-    for p in Path(tempfile.gettempdir()).glob(PREVIEW_PREFIX + "*"):
-        shutil.rmtree(p, ignore_errors=True)
+# --------------------------------------------------------------------------- playback
 
 
-# --------------------------------------------------------------------------- widgets
+class StemPlayer(QObject):
+    """Plays a history entry with each stem mutable.
+
+    Three players run in lockstep (the full mix, vocals, instrumental) and
+    only one is ever audible: the mix when both stems are on, otherwise the
+    one stem that is on. Playing two separate players at once could drift
+    apart by a few milliseconds; this way what you hear is always one file.
+    """
+
+    positionChanged = Signal(int)
+    durationChanged = Signal(int)
+    playingChanged = Signal(bool)
+    error = Signal(str)
+
+    KEYS = ("mix", "vocals", "instrumental")
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self.players: dict[str, QMediaPlayer] = {}
+        self.outputs: dict[str, QAudioOutput] = {}
+        for key in self.KEYS:
+            out = QAudioOutput(self)
+            player = QMediaPlayer(self)
+            player.setAudioOutput(out)
+            player.errorOccurred.connect(self._on_error)
+            self.players[key] = player
+            self.outputs[key] = out
+        self.muted = {"vocals": False, "instrumental": False}
+        self.current = "mix"
+        self._reported_error = False
+        self.timer = QTimer(self)
+        self.timer.setInterval(33)
+        self.timer.timeout.connect(lambda: self.positionChanged.emit(self.position()))
+        lead = self.players["mix"]
+        lead.durationChanged.connect(lambda ms: self.durationChanged.emit(int(ms)))
+        lead.playbackStateChanged.connect(self._on_state)
+        self._apply_audible(sync=False)
+
+    def audible(self) -> str | None:
+        v, i = self.muted["vocals"], self.muted["instrumental"]
+        if not v and not i:
+            return "mix"
+        if not v:
+            return "vocals"
+        if not i:
+            return "instrumental"
+        return None
+
+    def _apply_audible(self, sync: bool = True) -> None:
+        key = self.audible()
+        if sync and key and key != self.current:
+            ref = self.players[self.current].position()
+            target = self.players[key]
+            if abs(target.position() - ref) > 40:
+                target.setPosition(ref)
+        for k, out in self.outputs.items():
+            out.setMuted(k != key)
+        if key:
+            self.current = key
+
+    def set_muted(self, stem: str, muted: bool) -> None:
+        self.muted[stem] = muted
+        self._apply_audible()
+
+    def load(self, entry: Entry) -> None:
+        self._reported_error = False
+        for key in self.KEYS:
+            path = entry.mix if key == "mix" else entry.stem_path(key)
+            self.players[key].setSource(QUrl.fromLocalFile(str(path)))
+        self.muted = {"vocals": False, "instrumental": False}
+        self.current = "mix"
+        self._apply_audible(sync=False)
+
+    def unload(self) -> None:
+        """Stop and release the files so they can be deleted (Windows locks open files)."""
+        for p in self.players.values():
+            p.stop()
+            p.setSource(QUrl())
+
+    def position(self) -> int:
+        return self.players[self.current].position()
+
+    def duration(self) -> int:
+        return self.players["mix"].duration()
+
+    def is_playing(self) -> bool:
+        return self.players["mix"].playbackState() == QMediaPlayer.PlayingState
+
+    def toggle(self) -> None:
+        if self.is_playing():
+            self.pause()
+            return
+        if self.duration() and self.position() >= self.duration() - 100:
+            self.seek(0)
+        for p in self.players.values():
+            p.play()
+
+    def pause(self) -> None:
+        for p in self.players.values():
+            p.pause()
+
+    def seek(self, ms: int) -> None:
+        for p in self.players.values():
+            p.setPosition(int(ms))
+        self.positionChanged.emit(int(ms))
+
+    def _on_state(self, state) -> None:
+        playing = state == QMediaPlayer.PlayingState
+        self.timer.start() if playing else self.timer.stop()
+        self.positionChanged.emit(self.position())
+        self.playingChanged.emit(playing)
+
+    def _on_error(self, _err, message: str) -> None:
+        log.warning("player error: %s", message)
+        if not self._reported_error:
+            self._reported_error = True
+            self.error.emit(
+                "This song can't be played on this computer (is a speaker or headset connected?).\n"
+                "You can still save the files and listen to them in your music player."
+            )
+
+
+class TrackView(QWidget):
+    """The two stems stacked as lanes, each with its spectrogram, and one playhead across both."""
+
+    seekRequested = Signal(float)  # fraction of the song
+    scrubbed = Signal(float)
+    muteToggled = Signal(str, bool)
+
+    LANES = (("vocals", "Vocals"), ("instrumental", "Instrumental"))
+    HEADER = 124
+    TOP = 8
+    LANE_H = 84
+    GAP = 12
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.images: dict[str, QImage | None] = {stem: None for stem, _ in self.LANES}
+        self.muted = {stem: False for stem, _ in self.LANES}
+        self.frac = 0.0
+        self._dragging = False
+        self.mute_buttons: dict[str, QPushButton] = {}
+        for stem, _ in self.LANES:
+            b = QPushButton("Mute", self)
+            b.setObjectName("laneMute")
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedWidth(b.fontMetrics().horizontalAdvance("Muted") + 32)
+            b.toggled.connect(lambda on, s=stem: self._on_mute(s, on))
+            self.mute_buttons[stem] = b
+        height = self.TOP + len(self.LANES) * self.LANE_H + (len(self.LANES) - 1) * self.GAP + 4
+        self.setFixedHeight(height)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_spectrograms(self, images: dict[str, QImage | None]) -> None:
+        self.images = images
+        for b in self.mute_buttons.values():
+            b.setChecked(False)
+        self.frac = 0.0
+        self.update()
+
+    def set_fraction(self, frac: float) -> None:
+        if not self._dragging:
+            self.frac = min(1.0, max(0.0, frac))
+            self.update()
+
+    def lane_rect(self, i: int) -> QRectF:
+        top = self.TOP + i * (self.LANE_H + self.GAP)
+        return QRectF(self.HEADER, top, max(1, self.width() - self.HEADER - 1), self.LANE_H)
+
+    def _on_mute(self, stem: str, muted: bool) -> None:
+        self.muted[stem] = muted
+        self.mute_buttons[stem].setText("Muted" if muted else "Mute")
+        self.muteToggled.emit(stem, muted)
+        self.update()
+
+    def resizeEvent(self, e) -> None:
+        for i, (stem, _) in enumerate(self.LANES):
+            r = self.lane_rect(i)
+            self.mute_buttons[stem].move(0, int(r.top() + 40))
+        super().resizeEvent(e)
+
+    def paintEvent(self, e) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        title_font = QFont(self.font())
+        title_font.setPointSizeF(self.font().pointSizeF() + 1)
+        title_font.setBold(True)
+
+        for i, (stem, label) in enumerate(self.LANES):
+            r = self.lane_rect(i)
+            p.setFont(title_font)
+            p.setPen(QColor(MUTED if self.muted[stem] else TEXT))
+            p.drawText(QRectF(0, r.top() + 8, self.HEADER - 8, 24), Qt.AlignLeft | Qt.AlignVCenter, label)
+
+            path = QPainterPath()
+            path.addRoundedRect(r, 10, 10)
+            p.save()
+            p.setClipPath(path)
+            p.fillRect(r, QColor(CARD))
+            img = self.images.get(stem)
+            if img is not None:
+                p.setOpacity(0.28 if self.muted[stem] else 1.0)
+                p.drawImage(r, img)
+                p.setOpacity(1.0)
+            p.restore()
+            p.setPen(QPen(QColor(BORDER), 1))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+
+        # Playhead across both lanes.
+        first, last = self.lane_rect(0), self.lane_rect(len(self.LANES) - 1)
+        x = first.left() + self.frac * first.width()
+        p.setPen(QPen(QColor(GREEN_DARK), 2))
+        p.drawLine(QPointF(x, first.top() - 4), QPointF(x, last.bottom() + 2))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(GREEN_DARK))
+        p.drawEllipse(QPointF(x, first.top() - 3), 5, 5)
+        p.end()
+
+    def _frac_at(self, x: float) -> float:
+        r = self.lane_rect(0)
+        return min(1.0, max(0.0, (x - r.left()) / r.width()))
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.LeftButton and e.position().x() >= self.HEADER:
+            self._dragging = True
+            self.frac = self._frac_at(e.position().x())
+            self.scrubbed.emit(self.frac)
+            self.update()
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._dragging:
+            self.frac = self._frac_at(e.position().x())
+            self.scrubbed.emit(self.frac)
+            self.update()
+        else:
+            self.setCursor(Qt.PointingHandCursor if e.position().x() >= self.HEADER else Qt.ArrowCursor)
+
+    def mouseReleaseEvent(self, e) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.seekRequested.emit(self.frac)
+
+
+# --------------------------------------------------------------------------- small widgets
 
 
 class DropZone(QFrame):
@@ -201,7 +507,7 @@ class DropZone(QFrame):
         super().__init__()
         self.setObjectName("dropzone")
         self.setAcceptDrops(True)
-        self.setMinimumHeight(130)
+        self.setMinimumHeight(124)
         lay = QVBoxLayout(self)
         lay.setAlignment(Qt.AlignCenter)
         lay.setSpacing(6)
@@ -222,7 +528,7 @@ class DropZone(QFrame):
 
     def show_file(self, path: Path | None) -> None:
         if path:
-            self.title.setText(f"🎵  {path.name}")
+            self.title.setText(path.name)
             self.hint.setText("Ready to split. Drop another file to replace it.")
             self.browse.setText("Choose a different file…")
         else:
@@ -275,15 +581,13 @@ class StageIndicator(QWidget):
             lay.addWidget(lab)
         lay.addStretch()
 
-    def set_states(self, current: Stage | None, skip_download: bool = False,
-                   done_through: Stage | None = None) -> None:
-        """Highlight ``current``; everything before it (or up to ``done_through``) is done."""
+    def set_states(self, current: Stage | None, skip_download: bool = False, all_done: bool = False) -> None:
         order = list(Stage)
         for stage, lab in self.labels.items():
             i = order.index(stage)
-            if stage is Stage.DOWNLOADING and skip_download and (current or done_through):
+            if stage is Stage.DOWNLOADING and skip_download and (current or all_done):
                 state = "skipped"
-            elif done_through is not None and i <= order.index(done_through):
+            elif all_done:
                 state = "done"
             elif current is None:
                 state = "pending"
@@ -295,155 +599,6 @@ class StageIndicator(QWidget):
                 state = "pending"
             lab.setProperty("state", state)
             _repolish(lab)
-
-
-class SeekSlider(QSlider):
-    """A slider that jumps to where you click instead of stepping."""
-
-    def mousePressEvent(self, e) -> None:
-        if e.button() == Qt.LeftButton and self.maximum() > 0:
-            value = QStyle.sliderValueFromPosition(
-                self.minimum(), self.maximum(), int(e.position().x()), self.width(),
-            )
-            self.setValue(value)
-            self.sliderMoved.emit(value)
-        super().mousePressEvent(e)
-
-
-class PreviewPlayer(QWidget):
-    """Play the vocals or the instrumental; switching keeps the position.
-
-    Both stems play in sync on two players and only the selected one is
-    audible, so switching is instant.
-    """
-
-    error = Signal(str)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.players: dict[str, QMediaPlayer] = {}
-        self.outputs: dict[str, QAudioOutput] = {}
-        for name in ("vocals", "instrumental"):
-            out = QAudioOutput(self)
-            player = QMediaPlayer(self)
-            player.setAudioOutput(out)
-            player.errorOccurred.connect(self._on_error)
-            self.players[name] = player
-            self.outputs[name] = out
-        self.active = "vocals"
-        self._reported_error = False
-
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
-
-        seg = QHBoxLayout()
-        seg.setSpacing(0)
-        self.group = QButtonGroup(self)
-        self.buttons: dict[str, QPushButton] = {}
-        for name, label, pos in (("vocals", "🎤  Vocals", "left"), ("instrumental", "🎸  Instrumental", "right")):
-            b = QPushButton(label)
-            b.setObjectName("segment")
-            b.setProperty("pos", pos)
-            b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, n=name: self.select(n))
-            self.group.addButton(b)
-            self.buttons[name] = b
-            seg.addWidget(b)
-        seg.addStretch()
-        self.buttons["vocals"].setChecked(True)
-        lay.addLayout(seg)
-
-        row = QHBoxLayout()
-        row.setSpacing(12)
-        self.play_btn = QPushButton()
-        self.play_btn.setObjectName("play")
-        self.play_btn.setCursor(Qt.PointingHandCursor)
-        self.play_btn.setToolTip("Play / pause")
-        self.play_btn.clicked.connect(self.toggle)
-        self.slider = SeekSlider(Qt.Horizontal)
-        self.slider.setRange(0, 0)
-        self.slider.sliderMoved.connect(self._on_slider_moved)
-        self.slider.sliderReleased.connect(lambda: self.seek(self.slider.value()))
-        self.time = QLabel("0:00 / 0:00")
-        self.time.setObjectName("time")
-        row.addWidget(self.play_btn)
-        row.addWidget(self.slider, 1)
-        row.addWidget(self.time)
-        lay.addLayout(row)
-
-        lead = self.players["vocals"]
-        lead.positionChanged.connect(self._on_position)
-        lead.durationChanged.connect(self._on_duration)
-        lead.playbackStateChanged.connect(self._update_play_icon)
-        self._update_play_icon()
-
-    def load(self, vocals: Path, instrumental: Path) -> None:
-        self._reported_error = False
-        self.players["vocals"].setSource(QUrl.fromLocalFile(str(vocals)))
-        self.players["instrumental"].setSource(QUrl.fromLocalFile(str(instrumental)))
-        self.select("vocals")
-        self.slider.setValue(0)
-
-    def unload(self) -> None:
-        """Stop and release the files so they can be deleted (Windows locks open files)."""
-        for p in self.players.values():
-            p.stop()
-            p.setSource(QUrl())
-        self.slider.setRange(0, 0)
-        self.time.setText("0:00 / 0:00")
-
-    def select(self, name: str) -> None:
-        self.active = name
-        self.buttons[name].setChecked(True)
-        lead = self.players["vocals"]
-        other = self.players["instrumental"]
-        if abs(lead.position() - other.position()) > 80:
-            other.setPosition(lead.position())
-        for n, out in self.outputs.items():
-            out.setMuted(n != name)
-
-    def toggle(self) -> None:
-        playing = self.players["vocals"].playbackState() == QMediaPlayer.PlayingState
-        for p in self.players.values():
-            p.pause() if playing else p.play()
-
-    def pause(self) -> None:
-        for p in self.players.values():
-            p.pause()
-
-    def seek(self, ms: int) -> None:
-        for p in self.players.values():
-            p.setPosition(ms)
-
-    def _on_slider_moved(self, ms: int) -> None:
-        self.time.setText(f"{_fmt_clock(ms)} / {_fmt_clock(self.slider.maximum())}")
-        if not self.slider.isSliderDown():
-            self.seek(ms)
-
-    def _on_position(self, ms: int) -> None:
-        if not self.slider.isSliderDown():
-            self.slider.setValue(ms)
-            self.time.setText(f"{_fmt_clock(ms)} / {_fmt_clock(self.slider.maximum())}")
-
-    def _on_duration(self, ms: int) -> None:
-        self.slider.setRange(0, ms)
-        self.time.setText(f"{_fmt_clock(self.slider.value())} / {_fmt_clock(ms)}")
-
-    def _update_play_icon(self, *_) -> None:
-        playing = self.players["vocals"].playbackState() == QMediaPlayer.PlayingState
-        icon = QStyle.SP_MediaPause if playing else QStyle.SP_MediaPlay
-        self.play_btn.setIcon(self.style().standardIcon(icon))
-
-    def _on_error(self, _err, message: str) -> None:
-        log.warning("preview player error: %s", message)
-        if not self._reported_error:
-            self._reported_error = True
-            self.error.emit(
-                "The preview can't be played on this computer (is a speaker or headset connected?).\n"
-                "You can still save the files and listen to them in your music player."
-            )
 
 
 def _card() -> tuple[QFrame, QVBoxLayout]:
@@ -468,6 +623,27 @@ def _divider() -> QFrame:
     line = QFrame()
     line.setObjectName("divider")
     return line
+
+
+def _button(text: str, name: str = "", slot: Callable | None = None) -> QPushButton:
+    b = QPushButton(text)
+    if name:
+        b.setObjectName(name)
+    b.setCursor(Qt.PointingHandCursor)
+    if slot:
+        b.clicked.connect(slot)
+    return b
+
+
+def _confirm(parent: QWidget, title: str, text: str, yes: str) -> bool:
+    box = QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setIcon(QMessageBox.Question)
+    ok = box.addButton(yes, QMessageBox.AcceptRole)
+    box.addButton("Cancel", QMessageBox.RejectRole)
+    box.exec()
+    return box.clickedButton() is ok
 
 
 # --------------------------------------------------------------------------- pages
@@ -496,10 +672,7 @@ class SetupPage(QWidget):
         self.status = QLabel("Starting download…")
         self.status.setObjectName("status")
         self.error = _message("error")
-        self.retry = QPushButton("Try again")
-        self.retry.setObjectName("primary")
-        self.retry.setCursor(Qt.PointingHandCursor)
-        self.retry.clicked.connect(self.start)
+        self.retry = _button("Try again", "primary", self.start)
         self.retry.hide()
         for w in (head, body, self.bar, self.status, self.error):
             c.addWidget(w)
@@ -551,11 +724,13 @@ class MainPage(QWidget):
         self.settings = window.settings
         self.file: Path | None = None
         self.worker: JobWorker | None = None
-        self.preview: Preview | None = None
+        self.entry: Entry | None = None
+        self.saved: JobResult | None = None
         self._stage: Stage | None = None
         self._skip_download = False
         self._sep_t0 = 0.0
         self._sep_f0 = 0.0
+        self._duration = 0
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -568,7 +743,6 @@ class MainPage(QWidget):
         self.drop.urlDropped.connect(self._on_url_dropped)
         self.drop.browseClicked.connect(self.browse_file)
         c.addWidget(self.drop)
-
         orrow = QHBoxLayout()
         orl = QLabel("or")
         orl.setObjectName("orLabel")
@@ -576,23 +750,18 @@ class MainPage(QWidget):
         orrow.addWidget(orl)
         orrow.addWidget(_divider(), 1)
         c.addLayout(orrow)
-
         self.url = QLineEdit()
         self.url.setPlaceholderText("Paste a YouTube link, e.g. https://www.youtube.com/watch?v=…")
         self.url.setClearButtonEnabled(True)
         self.url.textChanged.connect(self._on_url_changed)
         self.url.returnPressed.connect(self.start_split)
         c.addWidget(self.url)
-
-        self.go = QPushButton("Split song")
-        self.go.setObjectName("primary")
-        self.go.setCursor(Qt.PointingHandCursor)
-        self.go.clicked.connect(self.start_split)
+        self.go = _button("Split song", "primary", self.start_split)
         c.addWidget(self.go)
         lay.addWidget(card)
 
-        # --- progress / preview / save card
-        pcard, p = _card()
+        # --- progress card
+        self.progress_card, p = _card()
         self.stages = StageIndicator()
         self.bar = QProgressBar()
         self.bar.setTextVisible(False)
@@ -600,72 +769,92 @@ class MainPage(QWidget):
         self.status = QLabel("Choose a song to get started.")
         self.status.setObjectName("status")
         self.status.setWordWrap(True)
-        self.cancel_btn = QPushButton("Cancel")
-        self.cancel_btn.setCursor(Qt.PointingHandCursor)
-        self.cancel_btn.clicked.connect(self.cancel_job)
+        self.cancel_btn = _button("Cancel", "", self.cancel_job)
         statusrow = QHBoxLayout()
         statusrow.addWidget(self.status, 1)
         statusrow.addWidget(self.cancel_btn)
-        for w in (self.stages, self.bar):
-            p.addWidget(w)
+        self.split_error = _message("error")
+        p.addWidget(self.stages)
+        p.addWidget(self.bar)
         p.addLayout(statusrow)
+        p.addWidget(self.split_error)
+        lay.addWidget(self.progress_card)
 
-        # Preview + save section, shown once a song has been separated.
-        self.preview_box = QWidget()
-        pb = QVBoxLayout(self.preview_box)
-        pb.setContentsMargins(0, 6, 0, 0)
-        pb.setSpacing(12)
-        pb.addWidget(_divider())
-        self.preview_title = QLabel()
-        self.preview_title.setObjectName("sectionTitle")
-        self.preview_title.setWordWrap(True)
-        pb.addWidget(self.preview_title)
-        self.player = PreviewPlayer()
-        self.player.error.connect(self.show_error)
-        pb.addWidget(self.player)
+        # --- player card
+        self.player_card, q = _card()
+        q.setSpacing(14)
+        self.song_title = QLabel()
+        self.song_title.setObjectName("sectionTitle")
+        self.song_title.setWordWrap(True)
+        self.song_info = QLabel()
+        self.song_info.setObjectName("muted")
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        head.addWidget(self.song_title)
+        head.addWidget(self.song_info)
+        q.addLayout(head)
 
+        self.tracks = TrackView()
+        q.addWidget(self.tracks)
+
+        transport = QHBoxLayout()
+        transport.setSpacing(12)
+        self.play_btn = _button("", "play", self.toggle_play)
+        self.play_btn.setIconSize(QSize(22, 22))
+        self.play_btn.setToolTip("Play / pause")
+        self.time = QLabel("0:00 / 0:00")
+        self.time.setObjectName("time")
+        hint = QLabel("Click on the tracks to jump. Mute one to hear the other alone.")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        transport.addWidget(self.play_btn)
+        transport.addWidget(self.time)
+        transport.addSpacing(8)
+        transport.addWidget(hint, 1)
+        q.addLayout(transport)
+
+        q.addWidget(_divider())
         outrow = QHBoxLayout()
         outrow.setSpacing(8)
         outlab = QLabel("Save to:")
         outlab.setObjectName("muted")
         self.out_label = QLabel()
         self.out_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        self.change_btn = QPushButton("Change…")
-        self.change_btn.setCursor(Qt.PointingHandCursor)
-        self.change_btn.clicked.connect(self.choose_output)
+        self.change_btn = _button("Change…", "", self.choose_output)
         outrow.addWidget(outlab)
         outrow.addWidget(self.out_label, 1)
         outrow.addWidget(self.change_btn)
-        pb.addLayout(outrow)
+        q.addLayout(outrow)
 
         saverow = QHBoxLayout()
-        self.save_btn = QPushButton("Save MP3s")
-        self.save_btn.setObjectName("primary")
-        self.save_btn.setCursor(Qt.PointingHandCursor)
-        self.save_btn.clicked.connect(self.start_export)
-        self.open_btn = QPushButton("Open output folder")
-        self.open_btn.setObjectName("primary")
-        self.open_btn.setCursor(Qt.PointingHandCursor)
-        self.open_btn.clicked.connect(self.open_output)
-        self.discard_btn = QPushButton("Discard")
-        self.discard_btn.setCursor(Qt.PointingHandCursor)
-        self.discard_btn.clicked.connect(self.discard_preview)
+        self.save_btn = _button("Save MP3s", "primary", self.start_save)
+        self.open_btn = _button("Open folder", "", self.open_output)
+        self.delete_btn = _button("Delete from history", "danger", self.delete_current)
         saverow.addWidget(self.save_btn)
         saverow.addWidget(self.open_btn)
         saverow.addStretch()
-        saverow.addWidget(self.discard_btn)
-        pb.addLayout(saverow)
-        p.addWidget(self.preview_box)
-
-        self.error = _message("error")
-        self.success = _message("success")
-        p.addWidget(self.error)
-        p.addWidget(self.success)
-        lay.addWidget(pcard)
+        saverow.addWidget(self.delete_btn)
+        q.addLayout(saverow)
+        self.player_msg = _message("success")
+        self.player_err = _message("error")
+        q.addWidget(self.player_msg)
+        q.addWidget(self.player_err)
+        lay.addWidget(self.player_card)
         lay.addStretch()
 
+        self.player = StemPlayer(self)
+        self.player.positionChanged.connect(self._on_position)
+        self.player.durationChanged.connect(self._on_duration)
+        self.player.playingChanged.connect(lambda on: self.play_btn.setIcon(_transport_icon(on)))
+        self.player.error.connect(self._show_player_error)
+        self.tracks.muteToggled.connect(self.player.set_muted)
+        self.tracks.seekRequested.connect(lambda f: self.player.seek(int(f * self._duration)))
+        self.tracks.scrubbed.connect(
+            lambda f: self.time.setText(f"{_fmt_clock(f * self._duration)} / {_fmt_clock(self._duration)}")
+        )
+        self.play_btn.setIcon(_transport_icon(False))
+
         self.set_output_dir(Path(self.settings.value("output_dir", str(default_output_dir()))))
-        self.preview_box.hide()
         self._refresh()
 
     # ---- inputs
@@ -674,7 +863,7 @@ class MainPage(QWidget):
         if self.worker:
             return
         if path.suffix.lower() not in SUPPORTED_EXTENSIONS:
-            self.show_error(
+            self._show_split_error(
                 f"\"{path.name}\" isn't a supported audio file.\n"
                 "Please choose an MP3, WAV, M4A, FLAC or OGG file."
             )
@@ -684,7 +873,7 @@ class MainPage(QWidget):
         self.url.clear()
         self.url.blockSignals(False)
         self.drop.show_file(path)
-        self.clear_messages()
+        self.split_error.hide()
         self._refresh()
 
     def browse_file(self) -> None:
@@ -703,7 +892,7 @@ class MainPage(QWidget):
         if text.strip() and self.file:
             self.file = None
             self.drop.show_file(None)
-        self.clear_messages()
+        self.split_error.hide()
         self._refresh()
 
     def set_output_dir(self, path: Path) -> None:
@@ -717,6 +906,9 @@ class MainPage(QWidget):
         if path:
             self.set_output_dir(Path(path))
             self.settings.setValue("output_dir", path)
+            self.saved = None
+            self.player_msg.hide()
+            self._refresh()
 
     def _source(self) -> str | None:
         if self.file:
@@ -726,10 +918,6 @@ class MainPage(QWidget):
 
     # ---- state
 
-    @property
-    def has_unsaved_preview(self) -> bool:
-        return self.preview is not None and self.preview.saved is None
-
     def _refresh(self) -> None:
         busy = self.worker is not None
         splitting = busy and self.worker.label == "split"
@@ -738,27 +926,23 @@ class MainPage(QWidget):
         self.drop.setEnabled(not busy)
         self.drop.setAcceptDrops(not busy)
         self.url.setEnabled(not busy)
-        self.cancel_btn.setVisible(busy)
-        self.cancel_btn.setEnabled(busy)
-        self.bar.setVisible(busy or self.preview is None)
-        saved = self.preview is not None and self.preview.saved is not None
-        self.preview_box.setVisible(self.preview is not None and not splitting)
-        self.save_btn.setVisible(not saved)
-        self.save_btn.setEnabled(not busy)
-        self.open_btn.setVisible(saved)
-        self.discard_btn.setText("Close" if saved else "Discard")
-        self.discard_btn.setEnabled(not busy)
-        self.change_btn.setEnabled(not busy and not saved)
+        self.cancel_btn.setVisible(splitting)
+        self.cancel_btn.setEnabled(splitting)
+        self.progress_card.setVisible(splitting or self.split_error.isVisible() or self.entry is None)
+        self.player_card.setVisible(self.entry is not None)
+        self.save_btn.setEnabled(not busy and self.saved is None)
+        self.save_btn.setText("Saved" if self.saved else "Save MP3s")
+        self.open_btn.setVisible(self.saved is not None)
+        self.delete_btn.setEnabled(not busy)
+        self.change_btn.setEnabled(not busy)
 
     def _start_worker(self, fn: Callable, label: str, on_success: Callable) -> None:
         self.worker = JobWorker(fn, label)
         self.worker.progress.connect(self._on_progress)
         self.worker.succeeded.connect(on_success)
-        self.worker.failed.connect(self._on_failed)
+        self.worker.failed.connect(lambda msg: self._on_failed(label, msg))
         self.worker.cancelled.connect(self._on_cancelled)
         self.worker.finished.connect(self._on_finished)
-        self._stage = None
-        self.bar.setRange(0, 0)
         self._refresh()
         self.worker.start()
 
@@ -769,57 +953,108 @@ class MainPage(QWidget):
         if self.worker or not source:
             return
         if not self.file and not is_youtube_url(source):
-            self.show_error(
+            self._show_split_error(
                 "That doesn't look like a YouTube video link.\n"
                 "It should look like https://www.youtube.com/watch?v=…"
             )
             return
-        if self.has_unsaved_preview:
-            answer = QMessageBox.question(
-                self, "Split another song?",
-                f"\"{self.preview.sep.title}\" hasn't been saved yet. Discard it and split the new song?",
-            )
-            if answer != QMessageBox.Yes:
-                return
-        self.drop_preview()
-        self.clear_messages()
+        self.split_error.hide()
         self._skip_download = self.file is not None
+        self._stage = None
         self.stages.set_states(None, self._skip_download)
+        self.bar.setRange(0, 0)
         self.status.setText("Starting…")
-        self._start_worker(separate_with_preview(source), "split", self._on_separated)
+        self._start_worker(split_into_library(source), "split", self._on_split_done)
 
-    def _on_separated(self, preview: Preview) -> None:
-        self.preview = preview
-        self.stages.set_states(Stage.EXPORTING, self._skip_download, done_through=Stage.SEPARATING)
-        self.stages.labels[Stage.EXPORTING].setProperty("state", "pending")
-        _repolish(self.stages.labels[Stage.EXPORTING])
+    def _on_split_done(self, entry: Entry) -> None:
+        self.stages.set_states(None, self._skip_download, all_done=True)
         self.bar.setRange(0, 1000)
         self.bar.setValue(1000)
-        self.status.setText("Separation done. Have a listen, then save the two MP3 files.")
-        self.preview_title.setText(f"🎧  {preview.sep.title}")
-        self.player.load(preview.vocals_wav, preview.instrumental_wav)
+        self.status.setText("Done!")
+        self.load_entry(entry)
+        self.window_.refresh_history()
         QApplication.alert(self.window_)
 
-    # ---- export
+    # ---- player
 
-    def start_export(self) -> None:
-        if self.worker or self.preview is None:
+    def load_entry(self, entry: Entry) -> None:
+        self.player.unload()
+        self.entry = entry
+        self.saved = None
+        self.player_msg.hide()
+        self.player_err.hide()
+        self.song_title.setText(entry.title)
+        origin = "YouTube" if entry.from_youtube else "a file"
+        self.song_info.setText(
+            f"{_fmt_clock(entry.duration_s * 1000)}  ·  split {entry.created:%d %b %Y, %H:%M} from {origin}"
+        )
+        self._duration = int(entry.duration_s * 1000)
+        self.tracks.set_spectrograms({
+            stem: spectrogram_image(entry.spectrogram(stem), stem) for stem, _ in TrackView.LANES
+        })
+        self.time.setText(f"0:00 / {_fmt_clock(self._duration)}")
+        self.player.load(entry)
+        self._refresh()
+
+    def close_entry(self) -> None:
+        self.player.unload()
+        self.entry = None
+        self.saved = None
+        self.stages.set_states(None)
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        self.status.setText("Choose a song to get started.")
+        self._refresh()
+
+    def toggle_play(self) -> None:
+        if self.entry is not None:
+            self.player.toggle()
+
+    def _on_position(self, ms: int) -> None:
+        if self._duration:
+            self.tracks.set_fraction(ms / self._duration)
+        if not self.tracks._dragging:
+            self.time.setText(f"{_fmt_clock(ms)} / {_fmt_clock(self._duration)}")
+
+    def _on_duration(self, ms: int) -> None:
+        if ms > 0:
+            self._duration = ms
+            self.time.setText(f"{_fmt_clock(self.player.position())} / {_fmt_clock(ms)}")
+
+    def _show_player_error(self, msg: str) -> None:
+        self.player_msg.hide()
+        self.player_err.setText(msg)
+        self.player_err.show()
+
+    # ---- save / delete
+
+    def start_save(self) -> None:
+        if self.worker or self.entry is None:
             return
-        self.player.pause()
-        self.clear_messages()
-        sep, out_dir = self.preview.sep, self.out_dir
-        self._start_worker(lambda prog, cancel: export(sep, out_dir, prog, cancel), "export", self._on_exported)
+        self.player_msg.hide()
+        self.player_err.hide()
+        entry, out_dir = self.entry, self.out_dir
+        self._start_worker(lambda prog, cancel: export(entry, out_dir), "save", self._on_saved)
 
-    def _on_exported(self, result: JobResult) -> None:
-        if self.preview is not None:
-            self.preview.saved = result
-        self.stages.set_states(None, self._skip_download, done_through=Stage.EXPORTING)
-        self.bar.setRange(0, 1000)
-        self.bar.setValue(1000)
-        self.status.setText("All done!")
-        self.success.setText(f"Saved:\n•  {result.vocals.name}\n•  {result.instrumental.name}")
-        self.success.show()
-        QApplication.alert(self.window_)
+    def _on_saved(self, result: JobResult) -> None:
+        self.saved = result
+        self.player_msg.setText(f"Saved:\n•  {result.vocals.name}\n•  {result.instrumental.name}")
+        self.player_msg.show()
+
+    def delete_current(self) -> None:
+        if self.entry is None:
+            return
+        if not _confirm(self, "Delete from history?",
+                        f"Delete \"{self.entry.title}\" from the history?\n"
+                        "MP3s you already saved to a folder are kept.", "Delete"):
+            return
+        entry = self.entry
+        self.close_entry()
+        try:
+            library.delete(entry)
+        except UserError as exc:
+            self._show_split_error(str(exc))
+        self.window_.refresh_history()
 
     # ---- shared worker plumbing
 
@@ -855,72 +1090,184 @@ class MainPage(QWidget):
                 text += "  ·  this can take a few minutes"
         self.status.setText(text)
 
-    def _after_stop(self) -> None:
-        """Back to the right resting state after a failed or cancelled job."""
+    def _reset_progress(self) -> None:
+        self.stages.set_states(None)
         self.bar.setRange(0, 1000)
-        if self.preview is not None:
-            # An export failed or was cancelled: the separated song is still here.
-            self.stages.set_states(Stage.EXPORTING, self._skip_download, done_through=Stage.SEPARATING)
-            self.stages.labels[Stage.EXPORTING].setProperty("state", "pending")
-            _repolish(self.stages.labels[Stage.EXPORTING])
-            self.bar.setValue(1000)
-            self.status.setText("Not saved yet. You can try again or pick another folder.")
-        else:
-            self.stages.set_states(None)
-            self.bar.setValue(0)
-            self.status.setText("Choose a song to get started.")
+        self.bar.setValue(0)
+        self.status.setText("Choose a song to get started.")
 
-    def _on_failed(self, msg: str) -> None:
-        self._after_stop()
-        self.show_error(msg)
+    def _show_split_error(self, msg: str) -> None:
+        self.split_error.setText(msg)
+        self.split_error.show()
+        self._refresh()
+
+    def _on_failed(self, label: str, msg: str) -> None:
+        if label == "save":
+            self._show_player_error(msg)
+        else:
+            self._reset_progress()
+            self._show_split_error(msg)
         QApplication.alert(self.window_)
 
     def _on_cancelled(self) -> None:
-        self._after_stop()
-        self.status.setText("Cancelled. " + self.status.text())
+        self._reset_progress()
+        self.status.setText("Cancelled.")
 
     def _on_finished(self) -> None:
         self.worker = None
         self._refresh()
 
-    # ---- preview lifetime
-
-    def drop_preview(self) -> None:
-        self.player.unload()
-        if self.preview is not None:
-            shutil.rmtree(self.preview.folder, ignore_errors=True)
-        self.preview = None
-        self._refresh()
-
-    def discard_preview(self) -> None:
-        if self.has_unsaved_preview:
-            answer = QMessageBox.question(
-                self, "Discard?", f"Throw away the split of \"{self.preview.sep.title}\" without saving?",
-            )
-            if answer != QMessageBox.Yes:
-                return
-        self.drop_preview()
-        self.clear_messages()
-        self.stages.set_states(None)
-        self.bar.setValue(0)
-        self.status.setText("Choose a song to get started.")
-
-    def show_error(self, msg: str) -> None:
-        self.success.hide()
-        self.error.setText(msg)
-        self.error.show()
-
-    def clear_messages(self) -> None:
-        self.error.hide()
-        self.success.hide()
-
     def open_output(self) -> None:
-        saved = self.preview.saved if self.preview else None
-        if IS_WINDOWS and saved and saved.vocals.exists():
+        if IS_WINDOWS and self.saved and self.saved.vocals.exists():
             # Open Explorer with the vocals file selected.
-            subprocess.Popen(["explorer", "/select,", str(saved.vocals)], creationflags=SUBPROCESS_FLAGS)
+            subprocess.Popen(["explorer", "/select,", str(self.saved.vocals)], creationflags=SUBPROCESS_FLAGS)
         else:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(saved.vocals.parent if saved else self.out_dir)))
+            folder = self.saved.vocals.parent if self.saved else self.out_dir
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+
+
+class HistoryRow(QFrame):
+    def __init__(self, entry: Entry, current: bool, on_open: Callable, on_delete: Callable) -> None:
+        super().__init__()
+        self.setObjectName("historyRow")
+        self.setProperty("current", current)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(14)
+
+        thumb = QLabel()
+        thumb.setFixedSize(132, 44)
+        img = spectrogram_image(entry.spectrogram("vocals"), "vocals")
+        if img is not None:
+            pm = QPixmap.fromImage(img.scaled(132 * 2, 44 * 2, Qt.IgnoreAspectRatio, Qt.SmoothTransformation))
+            pm.setDevicePixelRatio(2)
+            thumb.setPixmap(pm)
+        thumb.setStyleSheet(f"border: 1px solid {BORDER}; border-radius: 6px;")
+        lay.addWidget(thumb)
+
+        text = QVBoxLayout()
+        text.setSpacing(2)
+        title = QLabel(entry.title)
+        title.setStyleSheet("font-weight: 600; font-size: 10.5pt;")
+        title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        title.setToolTip(entry.title)
+        origin = "YouTube" if entry.from_youtube else "file"
+        info = QLabel(
+            f"{entry.created:%d %b %Y, %H:%M}  ·  {_fmt_clock(entry.duration_s * 1000)}  ·  "
+            f"{origin}  ·  {_fmt_size(entry.size_bytes())}"
+        )
+        info.setObjectName("muted")
+        text.addWidget(title)
+        text.addWidget(info)
+        lay.addLayout(text, 1)
+
+        lay.addWidget(_button("Open", "small", lambda: on_open(entry)))
+        delete = _button("Delete", "danger", lambda: on_delete(entry))
+        delete.setProperty("class", "small")
+        delete.setStyleSheet("padding: 6px 12px; font-size: 9.5pt;")
+        lay.addWidget(delete)
+
+
+class HistoryPage(QWidget):
+    def __init__(self, window: "MainWindow") -> None:
+        super().__init__()
+        self.window_ = window
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(12)
+
+        top = QHBoxLayout()
+        back = _button("← Back", "", window.show_main)
+        title = QLabel("History")
+        title.setObjectName("pageTitle")
+        self.delete_all_btn = _button("Delete all", "danger", self.delete_all)
+        top.addWidget(back)
+        top.addSpacing(8)
+        top.addWidget(title)
+        top.addStretch()
+        top.addWidget(self.delete_all_btn)
+        lay.addLayout(top)
+
+        self.summary = QLabel()
+        self.summary.setObjectName("muted")
+        self.summary.setWordWrap(True)
+        lay.addWidget(self.summary)
+
+        self.list = QWidget()
+        self.list.setObjectName("historyList")
+        self.rows = QVBoxLayout(self.list)
+        self.rows.setContentsMargins(0, 0, 0, 0)
+        self.rows.setSpacing(8)
+        lay.addWidget(self.list)
+        self.empty = QLabel("Nothing here yet. Songs you split will show up here.")
+        self.empty.setObjectName("muted")
+        self.empty.setAlignment(Qt.AlignCenter)
+        self.empty.setMinimumHeight(120)
+        lay.addWidget(self.empty)
+        self.error = _message("error")
+        lay.addWidget(self.error)
+        lay.addStretch()
+        self.entries: list[Entry] = []
+
+    def refresh(self) -> None:
+        while self.rows.count():
+            w = self.rows.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        self.entries = library.list_entries()
+        current = self.window_.main_page.entry
+        for e in self.entries:
+            is_current = current is not None and current.folder == e.folder
+            self.rows.addWidget(HistoryRow(e, is_current, self.open_entry, self.delete_entry))
+        total = sum(e.size_bytes() for e in self.entries)
+        n = len(self.entries)
+        self.summary.setText(
+            f"{n} song{'s' if n != 1 else ''}  ·  {_fmt_size(total)} on this computer"
+            if n else ""
+        )
+        self.summary.setVisible(bool(n))
+        self.empty.setVisible(not n)
+        self.delete_all_btn.setEnabled(bool(n))
+
+    def open_entry(self, entry: Entry) -> None:
+        self.window_.show_main()
+        self.window_.main_page.load_entry(entry)
+
+    def _release_if_current(self, entries: list[Entry]) -> None:
+        page = self.window_.main_page
+        if page.entry is not None and any(page.entry.folder == e.folder for e in entries):
+            page.close_entry()
+
+    def delete_entry(self, entry: Entry) -> None:
+        if not _confirm(self, "Delete from history?",
+                        f"Delete \"{entry.title}\" from the history?\n"
+                        "MP3s you already saved to a folder are kept.", "Delete"):
+            return
+        self._release_if_current([entry])
+        self.error.hide()
+        try:
+            library.delete(entry)
+        except UserError as exc:
+            self.error.setText(str(exc))
+            self.error.show()
+        self.window_.refresh_history()
+
+    def delete_all(self) -> None:
+        if not self.entries:
+            return
+        total = sum(e.size_bytes() for e in self.entries)
+        if not _confirm(self, "Delete everything?",
+                        f"Delete all {len(self.entries)} songs from the history? This frees {_fmt_size(total)}.\n"
+                        "MP3s you already saved to a folder are kept.", "Delete all"):
+            return
+        self._release_if_current(self.entries)
+        self.error.hide()
+        try:
+            library.delete_all()
+        except UserError as exc:
+            self.error.setText(str(exc))
+            self.error.show()
+        self.window_.refresh_history()
 
 
 class MainWindow(QMainWindow):
@@ -928,31 +1275,37 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings(APP_NAME, APP_NAME)
         self.setWindowTitle(APP_NAME)
-        self.setMinimumSize(560, 560)
+        self.setMinimumSize(600, 560)
         screen = QApplication.primaryScreen()
-        avail = screen.availableGeometry().height() - 60 if screen else 860
-        self.resize(640, max(560, min(860, avail)))
+        avail = screen.availableGeometry().height() - 60 if screen else 900
+        self.resize(720, max(560, min(900, avail)))
 
         body = QWidget()
         body.setObjectName("scrollBody")
         outer = QVBoxLayout(body)
         outer.setContentsMargins(28, 24, 28, 20)
         outer.setSpacing(16)
+
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
         title = QLabel(APP_NAME)
         title.setObjectName("title")
         subtitle = QLabel("Split any song into vocals and instrumental.")
         subtitle.setObjectName("subtitle")
-        head = QVBoxLayout()
-        head.setSpacing(2)
-        head.addWidget(title)
-        head.addWidget(subtitle)
-        outer.addLayout(head)
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addLayout(titles, 1)
+        self.history_btn = _button("History", "", self.show_history)
+        header.addWidget(self.history_btn, alignment=Qt.AlignTop)
+        outer.addLayout(header)
 
         self.stack = QStackedWidget()
         self.setup_page = SetupPage(self)
         self.main_page = MainPage(self)
-        self.stack.addWidget(self.setup_page)
-        self.stack.addWidget(self.main_page)
+        self.history_page = HistoryPage(self)
+        for page in (self.setup_page, self.main_page, self.history_page):
+            self.stack.addWidget(page)
         outer.addWidget(self.stack, 1)
 
         footer = QLabel(f"v{__version__}")
@@ -966,18 +1319,29 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setWidget(body)
         self.setCentralWidget(scroll)
-
-        # Drops anywhere on the window go to the drop zone.
         self.setAcceptDrops(True)
 
+        self.refresh_history()
         if is_model_ready():
             self.show_main()
         else:
             self.stack.setCurrentWidget(self.setup_page)
+            self.history_btn.setEnabled(False)
             self.setup_page.start()
 
     def show_main(self) -> None:
+        self.history_btn.setEnabled(True)
         self.stack.setCurrentWidget(self.main_page)
+
+    def show_history(self) -> None:
+        self.history_page.refresh()
+        self.stack.setCurrentWidget(self.history_page)
+
+    def refresh_history(self) -> None:
+        n = len(library.list_entries())
+        self.history_btn.setText(f"History ({n})" if n else "History")
+        if self.stack.currentWidget() is self.history_page:
+            self.history_page.refresh()
 
     def _drops_allowed(self) -> bool:
         return self.stack.currentWidget() is self.main_page and self.main_page.worker is None
@@ -995,20 +1359,17 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e) -> None:
         page = self.main_page
-        if page.worker is not None or page.has_unsaved_preview:
-            what = "A song is still being processed." if page.worker else "Your split song hasn't been saved."
-            answer = QMessageBox.question(self, "Quit?", f"{what} Quit anyway?")
-            if answer != QMessageBox.Yes:
+        if page.worker is not None:
+            if not _confirm(self, "Quit?", "A song is still being processed. Quit anyway?", "Quit"):
                 e.ignore()
                 return
-        if page.worker is not None:
             page.worker.cancel.set()
             page.worker.wait(10_000)
         dl = self.setup_page.worker
         if dl is not None and dl.isRunning():
             dl.cancel.set()
             dl.wait(5_000)
-        page.drop_preview()
+        page.player.unload()
         e.accept()
 
 
@@ -1042,18 +1403,13 @@ def _setup_logging() -> None:
 def _light_palette(app: QApplication) -> None:
     """Pin a light palette so Windows dark mode doesn't half-apply to the Fusion style."""
     pal = QPalette()
-    pal.setColor(QPalette.Window, QColor("#f4f5fb"))
-    pal.setColor(QPalette.WindowText, QColor("#1d1d2b"))
-    pal.setColor(QPalette.Base, QColor("white"))
-    pal.setColor(QPalette.AlternateBase, QColor("#f4f5fb"))
-    pal.setColor(QPalette.Text, QColor("#1d1d2b"))
-    pal.setColor(QPalette.Button, QColor("white"))
-    pal.setColor(QPalette.ButtonText, QColor("#1d1d2b"))
-    pal.setColor(QPalette.Highlight, QColor("#6c4dff"))
-    pal.setColor(QPalette.HighlightedText, QColor("white"))
-    pal.setColor(QPalette.ToolTipBase, QColor("white"))
-    pal.setColor(QPalette.ToolTipText, QColor("#1d1d2b"))
-    pal.setColor(QPalette.PlaceholderText, QColor("#9a9db3"))
+    for role, color in (
+        (QPalette.Window, CREAM), (QPalette.WindowText, TEXT), (QPalette.Base, CARD),
+        (QPalette.AlternateBase, CREAM), (QPalette.Text, TEXT), (QPalette.Button, SAND),
+        (QPalette.ButtonText, TEXT), (QPalette.Highlight, GREEN), (QPalette.HighlightedText, GREEN_DARK),
+        (QPalette.ToolTipBase, CARD), (QPalette.ToolTipText, TEXT), (QPalette.PlaceholderText, "#A79F8B"),
+    ):
+        pal.setColor(role, QColor(color))
     app.setPalette(pal)
 
 
@@ -1082,7 +1438,7 @@ def main() -> int:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.{APP_NAME}")
         except Exception:
             pass
-    _clean_stale_previews()
+    library.clean_incomplete()
     app = make_app(sys.argv)
     win = MainWindow()
     win.show()
