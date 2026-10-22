@@ -787,7 +787,6 @@ class MainPage(QWidget):
         titles.addWidget(self.song_title)
         titles.addWidget(self.song_info)
         head.addLayout(titles, 1)
-        head.addWidget(_button("New split", "primary", self.new_split), alignment=Qt.AlignTop)
         q.addLayout(head)
 
         self.rows: dict[str, TrackRow] = {}
@@ -1223,7 +1222,12 @@ class MainWindow(QMainWindow):
         titles.addWidget(title)
         titles.addWidget(subtitle)
         header.addLayout(titles, 1)
+        self.new_btn = _button("New split", "primary", lambda: self.main_page.new_split())
+        self.new_btn.setStyleSheet("padding: 8px 16px; font-size: 10pt;")
+        self.new_btn.hide()
         self.history_btn = _button("History", "", self.show_history)
+        header.addWidget(self.new_btn, alignment=Qt.AlignTop)
+        header.addSpacing(8)
         header.addWidget(self.history_btn, alignment=Qt.AlignTop)
         outer.addLayout(header)
 
@@ -1260,6 +1264,7 @@ class MainWindow(QMainWindow):
         # Nothing else can be started while a song is being split.
         if hasattr(self, "history_btn"):
             self.history_btn.setEnabled(mode != "working" and self.stack.currentWidget() is not self.setup_page)
+            self.new_btn.setVisible(mode == "result" and self.stack.currentWidget() is self.main_page)
 
     def show_main(self) -> None:
         self.stack.setCurrentWidget(self.main_page)
@@ -1268,11 +1273,11 @@ class MainWindow(QMainWindow):
     def show_history(self) -> None:
         if self.main_page.mode == "working":
             return
-        self.main_page.unload_all() if self.main_page.entry is None else None
         for row in self.main_page.rows.values():
             row.pause()
         self.history_page.refresh()
         self.stack.setCurrentWidget(self.history_page)
+        self.new_btn.hide()
 
     def refresh_history(self) -> None:
         n = len(library.list_entries())

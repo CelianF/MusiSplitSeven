@@ -70,21 +70,58 @@ jobs:
           Get-Content $report
           if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
 
-      - name: Zip
-        id: zip
+      - name: Version
+        id: ver
         shell: pwsh
         run: |
           $version = python -c "import musisplit; print(musisplit.__version__)"
-          $name = "MusiSplitSeven-$version-win64"
-          Compress-Archive -Path dist/MusiSplitSeven -DestinationPath "$name.zip"
-          "name=$name" >> $env:GITHUB_OUTPUT
-          Get-Item "$name.zip" | Select-Object Name, Length
+          "version=$version" >> $env:GITHUB_OUTPUT
 
-      # GitHub zips artifacts itself, so upload the folder (not our zip) to avoid a zip inside a zip.
-      # The Release below gets our own single zip.
+      - name: Build installer (Inno Setup, preinstalled on the runner)
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /Qp "/DAppVersion=${{ steps.ver.outputs.version }}" packaging\installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Get-Item installer\*.exe | Select-Object Name, Length
+
+      - name: Smoke test the installer (install, self-test, uninstall)
+        shell: pwsh
+        run: |
+          $setup = (Get-Item installer\*-Setup.exe).FullName
+          $dir = Join-Path $env:RUNNER_TEMP "installed"
+          $p = Start-Process $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=`"$dir`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "install failed: $($p.ExitCode)" }
+          $exe = Join-Path $dir "MusiSplitSeven.exe"
+          if (-not (Test-Path $exe)) { throw "MusiSplitSeven.exe not installed" }
+          $shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "MusiSplitSeven.lnk"
+          if (-not (Test-Path $shortcut)) { throw "Start menu shortcut missing: $shortcut" }
+
+          $report = Join-Path $env:RUNNER_TEMP "selftest-installed.txt"
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $p = Start-Process $exe -ArgumentList "--self-test", "`"$report`"" -Wait -PassThru
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "installed self-test failed: $($p.ExitCode)" }
+
+          $p = Start-Process (Join-Path $dir "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES" -Wait -PassThru
+          Start-Sleep -Seconds 3  # the uninstaller finishes from a temp copy
+          if (Test-Path $exe) { throw "uninstall left MusiSplitSeven.exe behind" }
+          if (Test-Path $shortcut) { throw "uninstall left the Start menu shortcut" }
+          Write-Host "install / self-test / uninstall OK"
+
+      - name: Zip (portable)
+        shell: pwsh
+        run: Compress-Archive -Path dist/MusiSplitSeven -DestinationPath "MusiSplitSeven-${{ steps.ver.outputs.version }}-portable.zip"
+
+      # GitHub zips artifacts itself: upload the plain files, not our zip, to avoid a zip inside a zip.
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ steps.zip.outputs.name }}
+          name: MusiSplitSeven-${{ steps.ver.outputs.version }}-Setup
+          path: installer/*-Setup.exe
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: MusiSplitSeven-${{ steps.ver.outputs.version }}-portable
           path: dist/
           if-no-files-found: error
 
@@ -94,9 +131,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = python -c "import musisplit; print(musisplit.__version__)"
+          $version = "${{ steps.ver.outputs.version }}"
           if ("${{ github.ref_name }}" -ne "v$version") {
             throw "tag ${{ github.ref_name }} doesn't match app version $version (musisplit/__init__.py)"
           }
-          gh release create "${{ github.ref_name }}" "${{ steps.zip.outputs.name }}.zip" `
-            --title "MusiSplitSeven $version" --generate-notes
+          $notes = "**Download ``MusiSplitSeven-$version-Setup.exe`` and double-click it.** No admin rights needed.`n`n" +
+                   "The ``-portable.zip`` is the same app without installer (extract and run ``MusiSplitSeven.exe``)."
+          gh release create "${{ github.ref_name }}" `
+            (Get-Item installer\*-Setup.exe).FullName `
+            "MusiSplitSeven-$version-portable.zip" `
+            --title "MusiSplitSeven $version" --notes "$notes" --generate-notes

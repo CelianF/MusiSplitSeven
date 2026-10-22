@@ -13,14 +13,23 @@ Everything runs on your own computer. Nothing is uploaded anywhere.
 
 ### Install
 
-1. Download `MusiSplitSeven-<version>-win64.zip` and **extract** it. Right-click,
-   then *Extract All…*. Running it from inside the zip won't work.
-2. Open the extracted folder and double-click **`MusiSplitSeven.exe`**.
-3. Windows may show *"Windows protected your PC"* because the app isn't signed.
+1. Download **`MusiSplitSeven-<version>-Setup.exe`** from the
+   [Releases](../../releases) page and double-click it. No administrator rights
+   are needed.
+2. Windows may show *"Windows protected your PC"* because the app isn't signed.
    Click **More info → Run anyway**.
+3. The installer adds MusiSplitSeven to the Start menu and the Desktop, then
+   opens it.
 
 The first time it starts, the app downloads its separation model (316 MB, once
 only). It is stored in `%APPDATA%\StemSplit\models`.
+
+To update, run the newer Setup.exe; it replaces the old version and keeps your
+History. To uninstall, use *Settings → Apps*. The uninstaller asks whether to
+also delete the model and the History.
+
+There is also a `-portable.zip` with the same app and no installer: extract it
+and run `MusiSplitSeven.exe`.
 
 ### Split a song
 
@@ -94,10 +103,14 @@ Every push to `main` (and every `v*` tag) runs
    This splits a test track, exports the MP3s, loads the preview player and
    opens the window. It also tries a YouTube download, but only warns if that
    fails, because YouTube often blocks CI machines.
-6. uploads the app folder as an artifact (GitHub zips it, so you download a
-   single zip)
-7. for a `v*` tag (for example `v0.1.1`), also publishes a GitHub Release with
-   the zip. The tag must match `__version__` in `musisplit/__init__.py`.
+6. builds `MusiSplitSeven-<version>-Setup.exe` with Inno Setup
+   ([`packaging/installer.iss`](packaging/installer.iss); Inno Setup is
+   preinstalled on GitHub's Windows runners). It then installs it silently,
+   runs the self-test on the installed app, and uninstalls it again.
+7. uploads the Setup.exe and the portable app folder as artifacts
+8. for a `v*` tag (for example `v0.1.3`), also publishes a GitHub Release with
+   the Setup.exe and a portable zip. The tag must match `__version__` in
+   `musisplit/__init__.py`.
 
 To release a new version, bump `__version__` (and `packaging/version_info.txt`),
 then push a tag: `git tag v0.1.2 && git push origin v0.1.2`. The zip then shows
@@ -113,7 +126,9 @@ py -3.11 -m venv .venv
 pip install -r requirements-build.txt
 pwsh scripts\fetch_ffmpeg.ps1
 pyinstaller --noconfirm --clean MusiSplitSeven.spec
-# result: dist\MusiSplitSeven\MusiSplitSeven.exe  (zip the whole dist\MusiSplitSeven folder)
+# app folder: dist\MusiSplitSeven\MusiSplitSeven.exe
+& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.1.3 packaging\installer.iss
+# installer: installer\MusiSplitSeven-0.1.3-Setup.exe
 ```
 
 ### Development (any OS)
