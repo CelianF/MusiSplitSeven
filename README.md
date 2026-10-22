@@ -199,7 +199,7 @@ neither clips and they still add back up to the original song.
 
 ## Licenses
 
-- App code: no license chosen yet (private repo). Pick one before making it public.
+- App code: [MIT](LICENSE).
 - Separation model and demucs-onnx: MIT.
 - `ffmpeg.exe`: LGPL v2.1+ build from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds),
   shipped unmodified in `_internal/ffmpeg/` together with its `LICENSE.txt`.
