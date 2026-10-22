@@ -1,6 +1,7 @@
 """Audio-only YouTube download with yt-dlp."""
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from collections.abc import Callable
@@ -12,6 +13,8 @@ from yt_dlp.utils import DownloadCancelled, DownloadError
 
 from .errors import Cancelled, NoInternetError, UserError, looks_like_network_error
 from .paths import ffmpeg_exe
+
+log = logging.getLogger("musisplit")
 
 MAX_DURATION_S = 30 * 60
 
@@ -44,6 +47,7 @@ class _QuietLogger:
 
 def _friendly(exc: DownloadError) -> UserError:
     msg = str(exc)
+    log.warning("yt-dlp failed: %s", msg)
     low = msg.lower()
     if looks_like_network_error(msg):
         return NoInternetError("the video")

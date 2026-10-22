@@ -124,7 +124,7 @@ def main(argv: list[str]) -> int:
         try:
             lines.append(f"PASS youtube download {youtube_download()}")
         except Exception as exc:
-            lines.append(f"WARN youtube download failed: {exc}")
+            lines.append(f"WARN youtube download failed: {exc} (cause: {exc.__cause__})")
     lines.append("ALL PASSED" if failures == 0 else f"{failures} FAILED")
     report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0 if failures == 0 else 1
