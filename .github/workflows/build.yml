@@ -1,0 +1,84 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      MUSISPLIT_MODEL_DIR: ${{ github.workspace }}\.model
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Fetch ffmpeg
+        run: pwsh scripts/fetch_ffmpeg.ps1
+
+      - name: Cache model
+        uses: actions/cache@v6
+        with:
+          path: .model
+          key: htdemucs-onnx-68d0bf16428ef66e692cdff8a9ccf28f1ef3f69440d57e58605a4cc55fcc5e74
+
+      - name: Download model (for tests only; the app downloads it on first launch)
+        run: python -c "from musisplit.model import ensure_model; print(ensure_model())"
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: Build with PyInstaller
+        run: pyinstaller --noconfirm --clean MusiSplitSeven.spec
+
+      - name: Check bundled runtime DLLs
+        shell: pwsh
+        run: |
+          # The friend's PC may not have the Visual C++ runtime installed.
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+            $found = Get-ChildItem -Recurse -Filter $dll dist/MusiSplitSeven | Select-Object -First 1
+            if (-not $found) { throw "$dll is not bundled" }
+            Write-Host "ok $dll -> $($found.FullName)"
+          }
+
+      - name: Smoke test the build from a clean folder
+        shell: pwsh
+        run: |
+          $clean = Join-Path $env:RUNNER_TEMP "clean"
+          New-Item -ItemType Directory -Force -Path $clean | Out-Null
+          Copy-Item -Recurse dist/MusiSplitSeven $clean
+          $report = Join-Path $env:RUNNER_TEMP "selftest.txt"
+          $env:PATH = "C:\Windows\System32;C:\Windows"  # no ffmpeg or Python on PATH
+          $p = Start-Process -FilePath (Join-Path $clean "MusiSplitSeven\MusiSplitSeven.exe") `
+                -ArgumentList "--self-test", "`"$report`"", "--net" `
+                -WorkingDirectory $clean -Wait -PassThru
+          Get-Content $report
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+
+      - name: Zip
+        id: zip
+        shell: pwsh
+        run: |
+          $version = python -c "import musisplit; print(musisplit.__version__)"
+          $name = "MusiSplitSeven-$version-win64"
+          Compress-Archive -Path dist/MusiSplitSeven -DestinationPath "$name.zip"
+          "name=$name" >> $env:GITHUB_OUTPUT
+          Get-Item "$name.zip" | Select-Object Name, Length
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.zip.outputs.name }}
+          path: ${{ steps.zip.outputs.name }}.zip
+          if-no-files-found: error
