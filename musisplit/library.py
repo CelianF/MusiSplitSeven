@@ -96,7 +96,8 @@ def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str,
     """Store a separated song (MP3s + spectrograms) and return its entry."""
     progress = on_progress or (lambda f, m: None)
     root = library_dir()
-    created = datetime.now().replace(microsecond=0)
+    # Full precision so newest-first order is exact even for splits in the same second.
+    created = datetime.now()
     name = f"{created:%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
     tmp = root / f".{name}.tmp"
     try:
