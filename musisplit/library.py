@@ -6,9 +6,8 @@ Each split is a folder::
         meta.json              title, source, date, duration
         vocals.mp3             the two stems
         instrumental.mp3
-        mix.mp3                vocals + instrumental, played when both lanes are on
-        vocals.spec.npy        spectrograms for the player view
-        instrumental.spec.npy
+        vocals.wave.npy        waveform bars for the player view
+        instrumental.wave.npy
 
 A split is written into a hidden ``.<name>.tmp`` folder and renamed when
 complete, so a crash or cancel never leaves a half-written entry.
@@ -27,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from . import audio, spectrogram
+from . import audio, waveform
 from .errors import UserError
 from .paths import app_data_dir
 
@@ -55,18 +54,26 @@ class Entry:
     def instrumental(self) -> Path:
         return self.folder / "instrumental.mp3"
 
-    @property
-    def mix(self) -> Path:
-        return self.folder / "mix.mp3"
-
     def stem_path(self, stem: str) -> Path:
         return self.folder / f"{stem}.mp3"
 
-    def spectrogram(self, stem: str) -> np.ndarray | None:
+    def waveform(self, stem: str) -> np.ndarray | None:
+        """Bar levels for ``stem``. Entries from v0.1.1 have none yet: compute and cache them."""
+        path = self.folder / f"{stem}.wave.npy"
         try:
-            return np.load(self.folder / f"{stem}.spec.npy", allow_pickle=False)
+            return np.load(path, allow_pickle=False)
         except (OSError, ValueError):
+            pass
+        try:
+            bars = dict(zip(STEMS, waveform.compute_pair(*(audio.decode(self.stem_path(s)) for s in STEMS))))
+        except (UserError, OSError, ValueError):
             return None
+        for s, data in bars.items():
+            try:
+                np.save(self.folder / f"{s}.wave.npy", data)
+            except OSError:
+                pass
+        return bars[stem]
 
     @property
     def from_youtube(self) -> bool:
@@ -93,7 +100,7 @@ class Entry:
 def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str,
         on_progress: Callable[[float | None, str], None] | None = None,
         cancel: threading.Event | None = None) -> Entry:
-    """Store a separated song (MP3s + spectrograms) and return its entry."""
+    """Store a separated song (MP3s + waveform bars) and return its entry."""
     progress = on_progress or (lambda f, m: None)
     root = library_dir()
     # Full precision so newest-first order is exact even for splits in the same second.
@@ -106,23 +113,19 @@ def add(vocals: np.ndarray, instrumental: np.ndarray, title: str, source: str,
         raise UserError(f"Couldn't create the history folder {root}.\n{exc.strerror}") from exc
 
     try:
-        progress(None, "Drawing the spectrograms…")
-        spec_v, spec_i = spectrogram.compute_pair(vocals, instrumental)
-        np.save(tmp / "vocals.spec.npy", spec_v)
-        np.save(tmp / "instrumental.spec.npy", spec_i)
+        bars_v, bars_i = waveform.compute_pair(vocals, instrumental)
+        np.save(tmp / "vocals.wave.npy", bars_v)
+        np.save(tmp / "instrumental.wave.npy", bars_i)
 
-        mix = np.clip(vocals + instrumental, -1.0, 1.0)
         jobs = (
             (vocals, "vocals.mp3", f"{title} (vocals)", "Saving vocals…"),
             (instrumental, "instrumental.mp3", f"{title} (instrumental)", "Saving instrumental…"),
-            (mix, "mix.mp3", title, "Saving the full mix…"),
         )
         for n, (data, filename, tag, msg) in enumerate(jobs):
             progress(n / len(jobs), msg)
             audio.encode_mp3(data, tmp / filename, title=tag,
                              on_progress=lambda f, n=n, msg=msg: progress((n + f) / len(jobs), msg),
                              cancel=cancel)
-        del mix
 
         meta = {
             "title": title,

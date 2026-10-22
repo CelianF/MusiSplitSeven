@@ -31,18 +31,25 @@ only). It is stored in `%APPDATA%\StemSplit\models`.
 2. Click **Split song**. The progress bar goes through
    *Downloading → Separating → Exporting*. Separating takes the longest: a few
    minutes per song on an average laptop. You can keep using the computer.
-3. **Listen.** The vocals and instrumental are shown on top of each other, each
-   with a picture of its sound (a spectrogram). Press play to hear the full
-   song. Click **Mute** on one track to hear only the other. Click anywhere on
-   the tracks to jump to that point.
-4. Choose where to save (the default is `Music\StemSplit`), then click
-   **Save MP3s**. You get:
-   - `<song title> - vocals.mp3`
-   - `<song title> - instrumental.mp3`
-5. Click **Open folder** to see the files.
+3. **Listen.** When the split is done, you see one row per track:
 
-If a file with the same name already exists, the new one is numbered
-(`Song (2) - vocals.mp3`), so nothing is overwritten.
+   ```
+   (▶) Vocals        ▮▮▮▯▯▯▯▯▯▯▯▯   (Save)
+   (▶) Instrumental  ▮▮▮▮▮▮▯▯▯▯▯▯   (Save)
+   ```
+
+   Press ▶ to play a track; starting one pauses the other. The bars show how
+   loud the track is over time, and the dark part is what has already played.
+   Click or drag on the bars to jump.
+4. **Save** the track you want. The suggested name is
+   `<song title> - vocals.mp3` (or `- instrumental.mp3`) in `Music\StemSplit`,
+   and you can pick another place. Existing files are never overwritten: a
+   number is added instead (`Song (2) - vocals.mp3`). **Open folder** shows the
+   saved file.
+5. Click **New split** to do another song.
+
+While a song is being split, the window only shows the progress and a Cancel
+button.
 
 ### History
 
@@ -53,8 +60,8 @@ see them all:
 - **Open** loads a song back into the player.
 - **Delete** removes one song. **Delete all** clears the whole history.
 
-Deleting from History never touches MP3s you already saved to a folder. The
-history uses about 7 MB per minute of music. It lives in
+Deleting from History never touches MP3s you already saved. The history uses
+about 5 MB per minute of music. It lives in
 `%APPDATA%\StemSplit\library`.
 
 ### If something goes wrong
@@ -87,7 +94,8 @@ Every push to `main` (and every `v*` tag) runs
    This splits a test track, exports the MP3s, loads the preview player and
    opens the window. It also tries a YouTube download, but only warns if that
    fails, because YouTube often blocks CI machines.
-6. zips the build and uploads it as an artifact
+6. uploads the app folder as an artifact (GitHub zips it, so you download a
+   single zip)
 7. for a `v*` tag (for example `v0.1.1`), also publishes a GitHub Release with
    the zip. The tag must match `__version__` in `musisplit/__init__.py`.
 
@@ -142,8 +150,8 @@ The app icon is generated from `assets/icon_source.jpg` by
 | `musisplit/audio.py` | decode any input to 44.1 kHz stereo float, and encode 320 kbps MP3, both with the bundled ffmpeg |
 | `musisplit/model.py` | first-launch model download: pinned URL, SHA-256 check, resumes partial downloads |
 | `musisplit/separator.py` | runs the `htdemucs` ONNX model in 7.8 s chunks with overlap-add; vocals = stem 3, instrumental = drums + bass + other |
-| `musisplit/library.py` | the History: each split is kept as MP3s plus spectrograms, written atomically |
-| `musisplit/spectrogram.py` | log-frequency spectrograms for the player view (numpy only) |
+| `musisplit/library.py` | the History: each split is kept as two MP3s plus waveform bars, written atomically |
+| `musisplit/waveform.py` | peak levels for the bar waveforms (numpy only) |
 | `musisplit/pipeline.py` | Download → Separate → Export (into History), then copy to a folder; no UI code |
 | `musisplit/gui.py` | PySide6 window; all work runs on background threads |
 
@@ -157,11 +165,6 @@ above 0.99 with the matching source in a test mix built from known parts.
 **Memory.** onnxruntime's default graph optimizations push peak RAM to
 about 3.8 GB. The app turns them off and disables memory-pattern planning,
 which brings the peak down to about 1.6 GB and costs about 8% in speed.
-
-**Playback.** The History also stores a full mix of the two stems. Three
-players run in lockstep (mix, vocals, instrumental), and only the one that
-matches the mute buttons is audible. Two separate players playing at once could
-drift apart by a few milliseconds; this way you always hear a single file.
 
 **Volume.** Both stems are scaled by the same gain (only when needed), so
 neither clips and they still add back up to the original song.

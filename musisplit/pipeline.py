@@ -152,7 +152,7 @@ def separate_source(source: str | Path, on_progress: ProgressCallback,
 
 def save_to_library(sep: Separated, source: str | Path, on_progress: ProgressCallback,
                     cancel: threading.Event | None = None) -> library.Entry:
-    """Exporting: encode both stems (and their mix) into the local history."""
+    """Exporting: encode both stems into the local history."""
     return library.add(
         sep.vocals, sep.instrumental, sep.title, str(source).strip(),
         on_progress=lambda f, msg: on_progress(Stage.EXPORTING, f, msg),
@@ -195,6 +195,27 @@ def export(entry: library.Entry, out_dir: Path) -> JobResult:
             p.unlink(missing_ok=True)
         raise
     return JobResult(title=entry.title, vocals=vocals_path, instrumental=inst_path)
+
+
+def export_stem(entry: library.Entry, stem: str, dest: Path) -> Path:
+    """Copy one stem from the history to ``dest`` (the UI's "Save as…")."""
+    src = entry.stem_path(stem)
+    if not src.is_file():
+        raise UserError(f"The files for \"{entry.title}\" are missing from the history.\nPlease split it again.")
+    tmp = dest.with_name(dest.name + ".part")
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, tmp)
+        tmp.replace(dest)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        if exc.errno == errno.ENOSPC:
+            raise UserError(f"The disk is full. Couldn't save \"{dest.name}\".") from exc
+        raise UserError(
+            f"Couldn't save \"{dest.name}\" in {dest.parent}.\n"
+            "Check that the folder exists and you can write to it."
+        ) from exc
+    return dest
 
 
 def run_job(source: str | Path, out_dir: Path, on_progress: ProgressCallback,

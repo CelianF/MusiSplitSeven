@@ -85,28 +85,27 @@ def main(argv: list[str]) -> int:
         entries = library.list_entries()
         assert len(entries) == 1, entries
         e = entries[0]
-        for f in (e.vocals, e.instrumental, e.mix):
+        for f in (e.vocals, e.instrumental):
             assert f.is_file(), f
-        spec = e.spectrogram("vocals")
-        assert spec is not None and spec.dtype.name == "uint8", spec
-        return f"{e.title!r} {e.size_bytes()} bytes, spectrogram {spec.shape}"
+        bars = e.waveform("vocals")
+        assert bars is not None and bars.dtype.name == "uint8", bars
+        return f"{e.title!r} {e.size_bytes()} bytes, waveform {bars.shape}"
 
-    def stem_player():
+    def track_player():
         from PySide6.QtCore import QCoreApplication
 
         from . import library
-        from .gui import StemPlayer
-        player = StemPlayer()
-        player.load(library.list_entries()[0])
+        from .gui import TrackRow
+        e = library.list_entries()[0]
+        row = TrackRow("vocals", "Vocals")
+        row.load(e.vocals, e.waveform("vocals"), int(e.duration_s * 1000))
         deadline = time.monotonic() + 15
-        while player.duration() <= 0 and time.monotonic() < deadline:
+        while row.player.duration() <= 0 and time.monotonic() < deadline:
             QCoreApplication.processEvents()
             time.sleep(0.05)
-        duration = player.duration()
+        duration = row.player.duration()
         assert duration > 9000, f"duration={duration}"
-        player.set_muted("instrumental", True)
-        assert player.audible() == "vocals"
-        player.unload()
+        row.unload()
         return f"duration={duration}ms"
 
     def main_window():
@@ -118,13 +117,15 @@ def main(argv: list[str]) -> int:
         page = "main" if win.stack.currentWidget() is win.main_page else "setup"
         win.main_page.load_entry(library.list_entries()[0])
         app.processEvents()
+        mode = win.main_page.mode
         shot = win.grab()
         win.show_history()
         app.processEvents()
         rows = len(win.history_page.entries)
         win.main_page.close_entry()
         win.hide()
-        return f"page={page} icon={not app.windowIcon().isNull()} history_rows={rows} shot={shot.width()}x{shot.height()}"
+        return (f"page={page} mode={mode} icon={not app.windowIcon().isNull()} "
+                f"history_rows={rows} shot={shot.width()}x{shot.height()}")
 
     def youtube_download():
         path, title = youtube.download_audio("https://www.youtube.com/watch?v=jNQXAC9IVRw", tmp)
@@ -139,7 +140,7 @@ def main(argv: list[str]) -> int:
     check("yt-dlp import", youtube_module)
     check("separate + export", separation)
     check("history entry", history)
-    check("stem player (QtMultimedia)", stem_player)
+    check("track player (QtMultimedia)", track_player)
     check("main window", main_window)
     if "--net" in argv:
         # Not counted as a failure: YouTube often blocks CI machines as bots.

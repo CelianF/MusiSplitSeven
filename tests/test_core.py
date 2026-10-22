@@ -19,7 +19,7 @@ from unittest import mock
 
 import numpy as np
 
-from musisplit import audio, library, model, pipeline, spectrogram, youtube
+from musisplit import audio, library, model, pipeline, waveform, youtube
 from musisplit.errors import Cancelled, NoInternetError, UserError
 from musisplit.paths import ffmpeg_exe
 from musisplit.separator import PEAK_TARGET, normalize_pair
@@ -278,27 +278,31 @@ class ModelDownloadTests(unittest.TestCase):
                 model.ensure_model()
 
 
-class SpectrogramTests(unittest.TestCase):
-    def tone(self, freq, seconds=3.0, amp=0.5):
+class WaveformTests(unittest.TestCase):
+    def tone(self, seconds=3.0, amp=0.5):
         t = np.arange(int(44100 * seconds)) / 44100
-        return np.stack([amp * np.sin(2 * np.pi * freq * t)] * 2).astype(np.float32)
+        return np.stack([amp * np.sin(2 * np.pi * 440 * t)] * 2).astype(np.float32)
 
-    def test_shape_and_loudness(self):
-        silent = np.zeros((2, 44100 * 3), np.float32)
-        v, i = spectrogram.compute_pair(self.tone(440), silent)
-        self.assertEqual(v.shape, (spectrogram.ROWS, spectrogram.COLUMNS))
-        self.assertEqual(v.dtype, np.uint8)
-        self.assertEqual(int(v.max()), 255)
-        self.assertEqual(int(i.max()), 0)  # shared scale: silence stays blank
+    def test_shape_and_shared_scale(self):
+        loud, quiet = self.tone(amp=0.8), self.tone(amp=0.2)
+        a, b = waveform.compute_pair(loud, quiet)
+        self.assertEqual(a.shape, (waveform.BUCKETS,))
+        self.assertEqual(a.dtype, np.uint8)
+        self.assertEqual(int(a.max()), 255)
+        self.assertLess(int(b.max()), 200)  # shared scale: the quiet stem looks quieter
 
-    def test_high_frequencies_on_top(self):
-        low, high = spectrogram.compute_pair(self.tone(100), self.tone(5000))
-        row = lambda img: int(np.argmax(img.mean(axis=1)))
-        self.assertLess(row(high), row(low))
+    def test_silence_and_short_audio(self):
+        silent = np.zeros((2, 44100), np.float32)
+        a, b = waveform.compute_pair(silent, silent)
+        self.assertEqual(int(a.max()), 0)
+        a, _ = waveform.compute_pair(self.tone(0.001), self.tone(0.001))
+        self.assertEqual(a.shape, (waveform.BUCKETS,))
 
-    def test_very_short_audio(self):
-        v, _ = spectrogram.compute_pair(self.tone(440, 0.01), self.tone(440, 0.01))
-        self.assertEqual(v.shape, (spectrogram.ROWS, spectrogram.COLUMNS))
+    def test_follows_loudness_over_time(self):
+        x = self.tone(4.0)
+        x[:, : x.shape[1] // 2] *= 0.1  # first half quiet
+        a, _ = waveform.compute_pair(x, np.zeros_like(x))
+        self.assertLess(a[: waveform.BUCKETS // 2 - 5].max(), a[waveform.BUCKETS // 2 + 5:].min())
 
 
 class LibraryTests(unittest.TestCase):
@@ -338,6 +342,15 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual([e.title for e in library.list_entries()], ["Good"])
         library.clean_incomplete()
         self.assertFalse((root / ".20260101-000000-abcdef.tmp").exists())
+
+    def test_waveform_rebuilt_for_old_entries(self):
+        x = np.stack([np.sin(np.linspace(0, 2000, 44100))] * 2).astype(np.float32) * 0.5
+        e = library.add(x, x * 0.5, "Old", "song.mp3")
+        for stem in library.STEMS:
+            (e.folder / f"{stem}.wave.npy").unlink()  # like an entry saved by v0.1.1
+        bars = e.waveform("vocals")
+        self.assertEqual(bars.shape, (waveform.BUCKETS,))
+        self.assertTrue((e.folder / "instrumental.wave.npy").is_file())
 
     def test_missing_library_dir(self):
         self.assertEqual(library.list_entries(), [])
@@ -432,9 +445,9 @@ class SeparationTests(unittest.TestCase):
         self.assertEqual(entry.title, "My Song")
         self.assertAlmostEqual(entry.duration_s, 12.0, delta=0.05)
         self.assertEqual(entry.source, str(self.song))
-        for f in (entry.vocals, entry.instrumental, entry.mix):
+        for f in (entry.vocals, entry.instrumental):
             self.assertAlmostEqual(duration_s(f), 12.0, delta=0.15)
-        self.assertEqual(entry.spectrogram("vocals").shape, (spectrogram.ROWS, spectrogram.COLUMNS))
+        self.assertEqual(entry.waveform("vocals").shape, (waveform.BUCKETS,))
         self.assertIn(entry.folder, [e.folder for e in library.list_entries()])
 
         out = self.dir / "later"
@@ -450,6 +463,16 @@ class SeparationTests(unittest.TestCase):
         self.assertNotIn(entry.folder, [e.folder for e in library.list_entries()])
         with self.assertRaisesRegex(UserError, "missing from the history"):
             pipeline.export(entry, out)
+        with self.assertRaisesRegex(UserError, "missing from the history"):
+            pipeline.export_stem(entry, "vocals", out / "x.mp3")
+
+    def test_export_single_stem(self):
+        sep = pipeline.separate_source(self.song, lambda *a: None)
+        entry = pipeline.save_to_library(sep, self.song, lambda *a: None)
+        dest = self.dir / "single" / "Mine.mp3"
+        self.assertEqual(pipeline.export_stem(entry, "instrumental", dest), dest)
+        self.assertEqual(dest.read_bytes(), entry.instrumental.read_bytes())
+        self.assertEqual([p.name for p in dest.parent.iterdir()], ["Mine.mp3"])
 
 
 @unittest.skipUnless(NET_TESTS and HAVE_MODEL, "set MUSISPLIT_NET_TESTS=1 (and download the model)")

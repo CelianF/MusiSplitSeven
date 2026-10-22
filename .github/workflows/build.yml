@@ -80,10 +80,12 @@ jobs:
           "name=$name" >> $env:GITHUB_OUTPUT
           Get-Item "$name.zip" | Select-Object Name, Length
 
+      # GitHub zips artifacts itself, so upload the folder (not our zip) to avoid a zip inside a zip.
+      # The Release below gets our own single zip.
       - uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.zip.outputs.name }}
-          path: ${{ steps.zip.outputs.name }}.zip
+          path: dist/
           if-no-files-found: error
 
       - name: Publish GitHub Release
