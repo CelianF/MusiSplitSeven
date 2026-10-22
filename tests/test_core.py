@@ -173,6 +173,17 @@ class InputValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(UserError, "Only YouTube links"):
             self.run_job("https://vimeo.com/12345")
 
+    def test_youtube_error_messages(self):
+        from yt_dlp.utils import DownloadError
+        cases = {
+            "ERROR: [youtube] x: Sign in to confirm you’re not a bot.": "blocking downloads",
+            "ERROR: [youtube] x: Private video. Sign in": "private",
+            "ERROR: [youtube] x: Video unavailable": "unavailable",
+            "ERROR: Unable to download webpage: <urlopen error [Errno 11001] getaddrinfo failed>": "internet",
+        }
+        for raw, expected in cases.items():
+            self.assertIn(expected, str(youtube._friendly(DownloadError(raw))), raw)
+
     def test_bad_youtube_url(self):
         with self.assertRaisesRegex(UserError, "doesn't look like a YouTube video link"):
             youtube.download_audio("https://www.youtube.com/playlist?list=x", self.dir)

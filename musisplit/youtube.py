@@ -51,6 +51,11 @@ def _friendly(exc: DownloadError) -> UserError:
     low = msg.lower()
     if looks_like_network_error(msg):
         return NoInternetError("the video")
+    if "not a bot" in low:
+        return UserError(
+            "YouTube is blocking downloads from this connection for now.\n"
+            "If you use a VPN, turn it off. Otherwise, try again later."
+        )
     if "private video" in low:
         return UserError("This video is private, so it can't be downloaded.")
     if "sign in to confirm your age" in low or "age-restricted" in low:
